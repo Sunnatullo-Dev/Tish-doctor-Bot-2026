@@ -192,14 +192,14 @@ def cmd_admin(m: types.Message):
     kb.row("❌ Yopish")
     bot.send_message(chat, "🛠 <b>ADMIN PANEL</b>\nKerakli bo‘limni tanlang:", parse_mode="HTML", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "❌ Yopish")
+@bot.message_handler(func=lambda m: button_matches(m.text, "❌ Yopish"))
 def admin_close(m: types.Message):
     if not is_admin(m.from_user.id):
         return
     clear_admin_states(m.from_user.id)
     bot.send_message(m.chat.id, "Admin panel yopildi.", reply_markup=types.ReplyKeyboardRemove())
 
-@bot.message_handler(func=lambda m: m.text == "📊 Statistika")
+@bot.message_handler(func=lambda m: button_matches(m.text, "📊 Statistika"))
 def admin_stats(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -233,7 +233,7 @@ def admin_stats(m: types.Message):
     )
     bot.send_message(m.chat.id, text, parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text == "📅 Bugungi yozuvlar")
+@bot.message_handler(func=lambda m: button_matches(m.text, "📅 Bugungi yozuvlar"))
 def admin_today_appts(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -254,7 +254,7 @@ def admin_today_appts(m: types.Message):
         kb.row(mk("🕑 Vaqtni o'zgartirish", f"admin|appt|reschedule|{a['id']}"))
         bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "📒 Onlayn daftar")
+@bot.message_handler(func=lambda m: button_matches(m.text, "📒 Onlayn daftar"))
 def admin_online_book(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -275,7 +275,7 @@ def admin_online_book(m: types.Message):
         kb.row(mk("🕑 Vaqtni o'zgartirish", f"admin|appt|reschedule|{a['id']}"))
         bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "⏰ Vaqt o'zgartirish so'rovlari")
+@bot.message_handler(func=lambda m: button_matches(m.text, "⏰ Vaqt o'zgartirish so'rovlari"))
 def admin_reschedule_requests(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -294,7 +294,7 @@ def admin_reschedule_requests(m: types.Message):
         kb.row(mk("🕑 Reschedule (admin qilishi)", f"admin|appt|reschedule|{a['id']}"), mk("❌ Bekor qilish", f"admin|appt|cancel|{a['id']}"))
         bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "🦷 Klinikalar")
+@bot.message_handler(func=lambda m: button_matches(m.text, "🦷 Klinikalar"))
 def admin_clinics(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -360,7 +360,7 @@ def cb_promote_doc(call: types.CallbackQuery):
     except Exception:
         bot.send_message(call.message.chat.id, "ID noto'g'ri formatda.")
 
-@bot.message_handler(func=lambda m: m.text == "👨‍⚕️ Doktorlar")
+@bot.message_handler(func=lambda m: button_matches(m.text, "👨‍⚕️ Doktorlar"))
 def admin_doctors(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -376,7 +376,7 @@ def admin_doctors(m: types.Message):
     bot.send_message(m.chat.id, "👨‍⚕️ Barcha doktorlar:", reply_markup=kb)
 
 # EXPORT Excel/CSV
-@bot.message_handler(func=lambda m: m.text == "📁 Eksport Excel")
+@bot.message_handler(func=lambda m: button_matches(m.text, "📁 Eksport Excel"))
 def admin_export_excel(m: types.Message):
     if not is_admin(m.from_user.id): return
     clear_admin_states(m.from_user.id)
@@ -425,7 +425,7 @@ def admin_export_excel(m: types.Message):
             logger.exception("csv export failed"); bot.send_message(m.chat.id, "CSV yaratishda xatolik yuz berdi.")
 
 # ---- Klinika qo'shish ----
-@bot.message_handler(func=lambda m: m.text == "➕ Klinika qo'shish")
+@bot.message_handler(func=lambda m: button_matches(m.text, "➕ Klinika qo'shish"))
 def admin_add_clinic_start(m: types.Message):
     if not is_admin(m.from_user.id): return
     start_add_clinic(m.from_user.id)
@@ -510,7 +510,7 @@ def admin_add_doctor_telegram(m: types.Message):
     bot.send_message(m.chat.id, f"✅ Doktor qo'shildi: {new_doc['name']}\nKlinika: {clinic['name']}\nID: {new_doc['id']}")
 
 # ---- Adminlar boshqaruvi ----
-@bot.message_handler(func=lambda m: m.text == "🛡️ Adminlar boshqaruvi")
+@bot.message_handler(func=lambda m: button_matches(m.text, "🛡️ Adminlar boshqaruvi"))
 def admin_manage_menu(m: types.Message):
     if not is_admin(m.from_user.id): return
     kb = InlineKeyboardMarkup()
@@ -560,7 +560,7 @@ def admin_add_receive(m: types.Message):
     save_data(); bot.send_message(m.chat.id, f"✅ {new_admin} adminlarga qo'shildi.")
 
 # ---- Sozlamalar (majburiy kanal, o'chirish) ----
-@bot.message_handler(func=lambda m: m.text == "⚙️ Sozlamalar")
+@bot.message_handler(func=lambda m: button_matches(m.text, "⚙️ Sozlamalar"))
 def admin_settings(m: types.Message):
     if not is_admin(m.from_user.id): return
     kb = InlineKeyboardMarkup()

@@ -1,6 +1,18 @@
 from clinic_bot.shared import *
 
 # ---------------- HELPERS ----------------
+def _button_key(value):
+    value = (value or "").replace("\ufe0f", "").replace("\u200d", "").strip()
+    if not value:
+        return ""
+    parts = value.split(maxsplit=1)
+    if len(parts) == 2 and not any(ch.isalnum() for ch in parts[0]):
+        value = parts[1]
+    return " ".join(value.casefold().split())
+
+def button_matches(actual, expected):
+    return _button_key(actual) == _button_key(expected)
+
 def new_id(prefix="id"):
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 

@@ -1,9 +1,9 @@
 from clinic_bot.shared import *
-from clinic_bot.helpers import is_admin
+from clinic_bot.helpers import button_matches, is_admin
 from clinic_bot.storage import save_data
 
 # ---------------- BROADCAST (admin) ----------------
-@bot.message_handler(func=lambda m: m.text == "📢 Reklama yuborish")
+@bot.message_handler(func=lambda m: button_matches(m.text, "📢 Reklama yuborish"))
 def admin_ad_start(m: types.Message):
     if not is_admin(m.from_user.id): return
     admin_ad_state[m.from_user.id] = "await_ad_text"

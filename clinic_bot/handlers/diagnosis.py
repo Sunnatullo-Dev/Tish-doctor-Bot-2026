@@ -1,7 +1,7 @@
 from html import escape
 
 from clinic_bot.shared import *
-from clinic_bot.helpers import find_clinic_by_id, get_doctor_rating, is_admin, mk, new_id
+from clinic_bot.helpers import button_matches, find_clinic_by_id, get_doctor_rating, is_admin, mk, new_id
 from clinic_bot.storage import save_data
 
 
@@ -132,7 +132,7 @@ def send_call_management_panel(admin_id, req):
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "🔎 Onlay tashhis")
+@bot.message_handler(func=lambda m: button_matches(m.text, "🔎 Onlay tashhis"))
 def user_diag_menu(m: types.Message):
     kb = InlineKeyboardMarkup()
     kb.row(mk("✉️ SMS yozish", "diag|sms"), mk("📞 Doktorga chaqiruv", "diag|call"))
