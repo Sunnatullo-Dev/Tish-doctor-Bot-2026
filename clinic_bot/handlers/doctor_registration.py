@@ -5,23 +5,86 @@ from clinic_bot.scheduler_jobs import schedule_reminder
 from clinic_bot.storage import save_data
 
 # ---------------- DOCTOR REGISTRATION ----------------
+def clean_optional_text(value, fallback="-"):
+    value = (value or "").strip()
+    if value.lower() in ("-", "yo'q", "yoq", "skip", "o'tkazish", "otkazish"):
+        return fallback
+    return value or fallback
+
+
+def clinic_label_from_data(data):
+    clinic = find_clinic_by_id(data.get('clinic_id'))
+    if clinic:
+        return clinic['name']
+    request = data.get('clinic_request') or {}
+    return f"Yangi klinika: {request.get('name', '-')}"
+
+
+def resolve_pending_clinic(pend):
+    clinic = find_clinic_by_id(pend.get('clinic_id'))
+    if clinic:
+        return clinic, False
+
+    request = pend.get('clinic_request') or {}
+    name = clean_optional_text(request.get('name'), "")
+    if not name:
+        return None, False
+
+    new_clinic = {
+        "id": new_id("c"),
+        "name": name,
+        "address": clean_optional_text(request.get('address'), "Manzil ko'rsatilmagan"),
+        "lat": 0.0,
+        "lon": 0.0,
+        "region": "Yangi klinika",
+        "manager_phone": clean_optional_text(request.get('phone'), pend.get('phone', "-")),
+        "doctors": [],
+        "created_from_doctor_request": pend.get('id'),
+        "created_at": datetime.now(tz).isoformat(),
+    }
+    clinics.append(new_clinic)
+    return new_clinic, True
+
+
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("docreg|clinic|"))
 def cb_docreg(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
     chat = call.from_user.id
     parts = call.data.split("|")
     if len(parts) >= 3 and parts[1] == "clinic":
-        clinic_id = None if parts[2] == "other" else parts[2]
-        user_state[chat] = {"step":"doc_name", "data":{"clinic_id": clinic_id}}
+        if parts[2] == "other":
+            user_state[chat] = {"step":"doc_other_clinic_name", "data":{"clinic_id": None, "clinic_request": {}}}
+            bot.send_message(chat, "Klinika nomini kiriting:")
+            return
+        clinic_id = parts[2]
+        user_state[chat] = {"step":"doc_name", "data":{"clinic_id": clinic_id, "clinic_request": None}}
         bot.send_message(chat, "Iltimos ismingizni kiriting:")
 
-@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get('step') in ("doc_name","doc_age","doc_experience","doc_phone","doc_certificate","doc_selfie"))
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get('step') in ("doc_other_clinic_name","doc_other_clinic_address","doc_other_clinic_phone","doc_name","doc_age","doc_experience","doc_phone","doc_certificate","doc_selfie"))
 def mh_doc_reg(m: types.Message):
     chat = m.chat.id
     st = user_state.get(chat)
     if not st: return
     step = st['step']; data = st.setdefault('data', {})
     txt = m.text.strip()
+    if step == "doc_other_clinic_name":
+        if not txt:
+            bot.send_message(chat, "Klinika nomi bo'sh bo'lmasin. Qayta kiriting:")
+            return
+        data.setdefault('clinic_request', {})['name'] = txt
+        st['step'] = "doc_other_clinic_address"
+        bot.send_message(chat, "Klinika manzilini kiriting (bilmasangiz '-' yuboring):")
+        return
+    if step == "doc_other_clinic_address":
+        data.setdefault('clinic_request', {})['address'] = clean_optional_text(txt, "Manzil ko'rsatilmagan")
+        st['step'] = "doc_other_clinic_phone"
+        bot.send_message(chat, "Klinika telefon raqamini kiriting (bilmasangiz '-' yuboring):")
+        return
+    if step == "doc_other_clinic_phone":
+        data.setdefault('clinic_request', {})['phone'] = clean_optional_text(txt, "-")
+        st['step'] = "doc_name"
+        bot.send_message(chat, "Endi o'zingiz haqingizda ma'lumot kiritamiz.\nIltimos ismingizni kiriting:")
+        return
     if step == "doc_name":
         data['name'] = txt; st['step'] = "doc_age"; bot.send_message(chat, "Yoshingizni kiriting:"); return
     if step == "doc_age":
@@ -53,6 +116,7 @@ def mh_doc_photo(m: types.Message):
                 "id": pend_id,
                 "telegram_id": chat,
                 "clinic_id": data.get('clinic_id'),
+                "clinic_request": data.get('clinic_request'),
                 "name": data.get('name'),
                 "age": data.get('age'),
                 "experience": data.get('experience'),
@@ -61,7 +125,7 @@ def mh_doc_photo(m: types.Message):
                 "selfie_file_id": data.get('selfie_file_id'),
                 "created_at": datetime.now(tz).isoformat()
             }
-            clinic_name = next((c['name'] for c in clinics if c['id'] == data.get('clinic_id')), "(belgilangan emas)")
+            clinic_name = clinic_label_from_data(data)
             caption = (f"🔔 <b>Yangi doktor arizasi</b>\nID: {pend_id}\nIsm: {pending_doctors[pend_id]['name']}\nYosh: {pending_doctors[pend_id]['age']}\n"
                        f"Tajriba: {pending_doctors[pend_id]['experience']}\nTel: {pending_doctors[pend_id]['phone']}\nKlinika: {clinic_name}")
             kb = InlineKeyboardMarkup()
@@ -103,14 +167,22 @@ def cb_admin_doc(call: types.CallbackQuery):
             "reviews": [],
             "photo_file_id": pend.get('selfie_file_id')
         }
-        clinic = find_clinic_by_id(pend.get('clinic_id')) or clinics[0]
-        clinic['doctors'].append(new_doc)
+        with data_lock:
+            clinic, created_clinic = resolve_pending_clinic(pend)
+            if not clinic:
+                bot.send_message(
+                    call.message.chat.id,
+                    "Arizada klinika ma'lumoti topilmadi. Doktordan arizani qayta yuborishini so'rang yoki arizani rad eting."
+                )
+                return
+            clinic['doctors'].append(new_doc)
         save_data()
         try:
             bot.send_message(pend['telegram_id'], f"🎉 Hurmatli {pend['name']}, siz qabul qilindingiz va {clinic['name']} ga qo'shildingiz. 🎉")
         except Exception:
             logger.exception("notify approved doctor failed")
-        bot.send_message(call.message.chat.id, f"✅ {pend['name']} qabul qilindi va {clinic['name']} ga qo'shildi.")
+        created_text = "\nYangi klinika ham yaratildi." if created_clinic else ""
+        bot.send_message(call.message.chat.id, f"✅ {pend['name']} qabul qilindi va {clinic['name']} ga qo'shildi.{created_text}")
     else:
         try:
             bot.send_message(pend['telegram_id'], "Afsuski, arizangiz rad etildi. Qo'shimcha ma'lumot uchun admin bilan bog'laning.")
