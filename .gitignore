@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+.env
+clinic_bot_data_final.json
+clinic_bot_data_final.json.*
