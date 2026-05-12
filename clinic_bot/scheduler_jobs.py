@@ -2,12 +2,76 @@ from clinic_bot.shared import *
 from clinic_bot.helpers import fmt_datetime_readable, mk
 
 # ---------------- SCHEDULER: reminders & rating prompt ----------------
+REMINDER_ELIGIBLE_APPT_STATUSES = {
+    'pending',
+    'accepted',
+    'accepted_by_doctor',
+    'rescheduled_by_admin',
+    'rescheduled_by_patient',
+    'rescheduled_by_doctor',
+}
+
+RATING_ELIGIBLE_APPT_STATUSES = {
+    'accepted',
+    'accepted_by_doctor',
+    'rescheduled_by_admin',
+    'rescheduled_by_patient',
+    'rescheduled_by_doctor',
+}
+
+TERMINAL_APPT_STATUSES = {
+    'cancelled',
+    'cancelled_clinic_deleted',
+    'cancelled_doctor_deleted',
+    'completed',
+    'closed',
+    'rejected',
+}
+
+
+def appt_status(appt):
+    return str((appt or {}).get('status') or '').strip().lower()
+
+
+def is_terminal_appointment(appt):
+    status = appt_status(appt)
+    return status in TERMINAL_APPT_STATUSES or status.startswith('cancelled')
+
+
+def should_schedule_appointment_jobs(appt):
+    if not appt or not appt.get('datetime'):
+        return False
+    if is_terminal_appointment(appt):
+        return False
+    return appt_status(appt) in REMINDER_ELIGIBLE_APPT_STATUSES
+
+
+def should_schedule_rating_prompt(appt):
+    if not should_schedule_appointment_jobs(appt):
+        return False
+    if appt.get('rated'):
+        return False
+    return appt_status(appt) in RATING_ELIGIBLE_APPT_STATUSES
+
+
+def cancel_appointment_jobs(appt_id):
+    for job_id in (f"rem_{appt_id}", f"rating_{appt_id}"):
+        try:
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+        except Exception:
+            logger.exception("failed to remove scheduled job %s", job_id)
+
+
 def schedule_reminder(appt_id):
     appt = appointments.get(appt_id)
     if not appt:
-        return
-    if appt.get('status') == 'cancelled':
-        return
+        cancel_appointment_jobs(appt_id)
+        return False
+    if not should_schedule_appointment_jobs(appt):
+        cancel_appointment_jobs(appt_id)
+        logger.info("Skipped scheduler jobs for inactive appointment %s (%s)", appt_id, appt.get('status'))
+        return False
     job_id = f"rem_{appt_id}"
     existing = scheduler.get_job(job_id)
     if existing:
@@ -17,7 +81,8 @@ def schedule_reminder(appt_id):
             logger.exception("failed to remove existing job")
     appt_dt = appt.get('datetime')
     if not appt_dt:
-        return
+        cancel_appointment_jobs(appt_id)
+        return False
     if appt_dt.tzinfo is None:
         appt_dt = tz.localize(appt_dt)
     remind_time = appt_dt - timedelta(hours=1)
@@ -37,16 +102,20 @@ def schedule_reminder(appt_id):
                 scheduler.remove_job(rating_job_id)
             except Exception:
                 logger.exception("failed to remove existing rating job")
-        if rating_run > datetime.now(tz):
+        if should_schedule_rating_prompt(appt) and rating_run > datetime.now(tz):
             scheduler.add_job(send_rating_prompt, 'date', run_date=rating_run, args=[appt_id], id=rating_job_id)
             logger.info("Scheduled rating %s -> %s", appt_id, rating_run.isoformat())
     except Exception:
         logger.exception("failed scheduling rating job")
+    return True
 
 def send_reminder_job(appt_id):
     appt = appointments.get(appt_id)
-    if not appt: return
-    if appt.get('status') == 'cancelled':
+    if not appt:
+        cancel_appointment_jobs(appt_id)
+        return
+    if not should_schedule_appointment_jobs(appt):
+        cancel_appointment_jobs(appt_id)
         return
     try:
         bot.send_message(appt['patient_chat'], f"⏰ Eslatma: Sizning uchrashuvingiz {fmt_datetime_readable(appt['datetime'])}. 1 soat qoldi.")
@@ -61,10 +130,11 @@ def send_reminder_job(appt_id):
 
 def send_rating_prompt(appt_id):
     appt = appointments.get(appt_id)
-    if not appt: return
-    if appt.get('status') == 'cancelled':
+    if not appt:
+        cancel_appointment_jobs(appt_id)
         return
-    if appt.get('rated'):
+    if not should_schedule_rating_prompt(appt):
+        cancel_appointment_jobs(appt_id)
         return
     try:
         kb = InlineKeyboardMarkup()
