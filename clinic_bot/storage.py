@@ -41,6 +41,12 @@ def load_data():
             s.diagnosis_requests.clear()
             s.diagnosis_requests.update(data.get("diagnosis_requests", {}))
 
+            s.mandatory_channels.clear()
+            s.mandatory_channels.update(data.get("mandatory_channels", {}))
+
+            s.channel_user_stats.clear()
+            s.channel_user_stats.update(data.get("channel_user_stats", {}))
+
             s.appointments.clear()
             appts_raw = data.get("appointments", {})
             for k, v in appts_raw.items():
@@ -90,6 +96,8 @@ def save_data():
             admins_snapshot = list(s.admins)
             admin_history_snapshot = copy_module.deepcopy(s.admin_history)
             diagnosis_snapshot = copy_module.deepcopy(s.diagnosis_requests)
+            mandatory_channels_snapshot = copy_module.deepcopy(s.mandatory_channels)
+            channel_user_stats_snapshot = copy_module.deepcopy(s.channel_user_stats)
             appointments_snapshot = copy_module.deepcopy(list(s.appointments.items()))
 
             to_save = {
@@ -101,6 +109,8 @@ def save_data():
                 "admins": admins_snapshot,
                 "admin_history": admin_history_snapshot,
                 "diagnosis_requests": diagnosis_snapshot,
+                "mandatory_channels": mandatory_channels_snapshot,
+                "channel_user_stats": channel_user_stats_snapshot,
             }
             for k, v in appointments_snapshot:
                 copy = v.copy()

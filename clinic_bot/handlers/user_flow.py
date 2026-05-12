@@ -1,10 +1,21 @@
 from clinic_bot.shared import *
+from clinic_bot.channel_gate import ensure_user_subscribed
 from clinic_bot.helpers import *
 from clinic_bot.keyboards import date_buttons, time_buttons
 from clinic_bot.scheduler_jobs import schedule_reminder
 from clinic_bot.storage import save_data
 
 # ---------------- HANDLERS ----------------
+
+def send_main_menu(chat, name=""):
+    greet = f"Assalomu Aleykum {name}" if name else "Assalomu Aleykum"
+    kb = InlineKeyboardMarkup()
+    kb.row(mk("Qabulga yozilish", "flow|booking"), mk("Men doktorman", "flow|doctor"))
+    kb.row(mk("Klinikalar ro'yxati", "list_clinics"), mk("Mening yozuvlarim", "flow|my_appts"))
+    kb.row(mk("Onlay tashhis", "diag_menu"))
+    send_random_sticker(chat)
+    bot.send_message(chat, f"<b>{greet}</b>\n\nQuyidagilardan birini tanlang:", parse_mode="HTML", reply_markup=kb)
+
 
 # /start
 @bot.message_handler(commands=['start'])
@@ -19,21 +30,31 @@ def cmd_start(m: types.Message):
     else:
         ui['starts'] = ui.get('starts', 0) + 1
     name = (m.from_user.first_name or "").strip()
-    greet = f"Assalomu Aleykum {name}👋" if name else "Assalomu Aleykum👋"
     user_state[chat] = {"step":"start", "data":{}}
-    kb = InlineKeyboardMarkup()
-    kb.row(mk("📥 Qabulga yozilish", "flow|booking"), mk("👩‍⚕️ Men doktorman", "flow|doctor"))
-    kb.row(mk("🔎 Klinikalar ro'yxati", "list_clinics"), mk("📋 Mening yozuvlarim", "flow|my_appts"))
-    kb.row(mk("🔎 Onlay tashhis", "diag_menu"))
-    send_random_sticker(chat)
-    bot.send_message(chat, f"<b>{greet}</b>\n\nQuyidagilardan birini tanlang:", parse_mode="HTML", reply_markup=kb)
+    if not ensure_user_subscribed(chat, uid):
+        save_data()
+        return
+    send_main_menu(chat, name)
     save_data()
+
+@bot.callback_query_handler(func=lambda c: c.data == "check_subscriptions")
+def cb_check_subscriptions(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    chat = call.message.chat.id
+    uid = call.from_user.id
+    if not ensure_user_subscribed(chat, uid):
+        return
+    name = (call.from_user.first_name or "").strip()
+    user_state[chat] = {"step":"start", "data":{}}
+    send_main_menu(chat, name)
 
 # Flow buttons (booking/doctor/help/my_appts)
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("flow|"))
 def cb_flow(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
     chat = call.message.chat.id
+    if not ensure_user_subscribed(chat, call.from_user.id):
+        return
     action = call.data.split("|",1)[1]
     if action == "booking":
         user_state[chat] = {"step":"booking_start", "data":{}}
@@ -77,6 +98,8 @@ def cb_phone_req(call: types.CallbackQuery):
 def cb_list_clinics(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
     chat = call.message.chat.id
+    if not ensure_user_subscribed(chat, call.from_user.id):
+        return
     kb = InlineKeyboardMarkup()
     for c in clinics:
         kb.add(mk(f"{c['name']} — {c['address']}", f"clinic|{c['id']}"))
@@ -87,6 +110,8 @@ def cb_list_clinics(call: types.CallbackQuery):
 def cb_clinic(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
     chat = call.message.chat.id
+    if not ensure_user_subscribed(chat, call.from_user.id):
+        return
     cid = call.data.split("|",1)[1]
     clinic = find_clinic_by_id(cid)
     if not clinic:
@@ -113,6 +138,8 @@ def cb_nodoc(call: types.CallbackQuery):
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("contact|"))
 def cb_contact(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
+    if not ensure_user_subscribed(call.message.chat.id, call.from_user.id):
+        return
     cid = call.data.split("|",1)[1]
     clinic = find_clinic_by_id(cid)
     if clinic:
@@ -151,6 +178,8 @@ def cb_back(call: types.CallbackQuery):
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("doctor|") and not c.data.startswith("doctor|appt|"))
 def cb_doctor(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
+    if not ensure_user_subscribed(call.message.chat.id, call.from_user.id):
+        return
     parts = call.data.split("|")
     if len(parts) < 3:
         bot.send_message(call.message.chat.id, "Tugma noto'g'ri.")

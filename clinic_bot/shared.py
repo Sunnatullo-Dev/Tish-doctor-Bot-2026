@@ -101,6 +101,8 @@ users_info = {}             # "uid" -> {"first_start": iso, "starts": int}
 admins = set([ADMIN_ID])    # admin ids
 admin_history = []          # list of admin add/remove records
 diagnosis_requests = {}     # req_id -> dict (ticket system)
+mandatory_channels = {}     # channel_key -> channel config/status dict
+channel_user_stats = {}     # user_id(str) -> channel_key -> latest membership/check data
 # each diagnosis_requests[req_id] includes: notify_msgs: list of {"admin_id", "chat_id", "message_id"}
 active_diag_chats = {}      # user_chat -> admin_id
 admin_active_diag = {}      # admin_id -> user_chat

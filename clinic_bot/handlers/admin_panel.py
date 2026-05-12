@@ -1,4 +1,12 @@
 from clinic_bot.shared import *
+from clinic_bot.channel_gate import (
+    add_mandatory_channel,
+    channel_button_text,
+    channel_stats_text,
+    delete_mandatory_channel,
+    refresh_channel_member_count,
+    set_channel_enabled,
+)
 from clinic_bot.helpers import *
 from clinic_bot.keyboards import date_buttons
 from clinic_bot.storage import save_data
@@ -141,6 +149,30 @@ def start_add_doctor(chat_id, clinic_id):
         return
     user_state[chat_id] = {"step":"admin_add_doctor_name","data":{"clinic_id": clinic_id}}
     bot.send_message(chat_id, f"{clinic['name']} uchun doktor ismini kiriting:")
+
+
+def send_channel_menu(chat_id):
+    kb = InlineKeyboardMarkup()
+    kb.row(mk("➕ Kanal qo'shish", "settings|channel_add"))
+    kb.row(mk("📊 Kanallar va statistika", "settings|channel_list"))
+    bot.send_message(chat_id, "Majburiy kanal boshqaruvi:", reply_markup=kb)
+
+
+def send_channel_list(chat_id):
+    if not mandatory_channels:
+        bot.send_message(chat_id, "Majburiy kanallar ro'yxati bo'sh.")
+        return
+    for channel in mandatory_channels.values():
+        refresh_channel_member_count(channel)
+        kb = InlineKeyboardMarkup()
+        kb.row(mk("📊 Statistika", f"settings|channel_stats|{channel['chat_id']}"), mk("👥 Foydalanuvchilar", f"settings|channel_users|{channel['chat_id']}"))
+        if channel.get("enabled", True):
+            kb.row(mk("⏸ Muzlatish", f"settings|channel_freeze|{channel['chat_id']}"))
+        else:
+            kb.row(mk("▶️ Faollashtirish", f"settings|channel_enable|{channel['chat_id']}"))
+        kb.row(mk("🗑️ O'chirish", f"settings|channel_delete_ask|{channel['chat_id']}"))
+        bot.send_message(chat_id, channel_button_text(channel), reply_markup=kb)
+    save_data()
 
 # ---------------- ADMIN PANEL & BROADCAST & EXPORT ----------------
 @bot.message_handler(commands=['admin'])
@@ -552,8 +584,7 @@ def cb_settings(call: types.CallbackQuery):
     if not is_admin(call.from_user.id): return
     action = call.data.split("|",1)[1]
     if action == "channel":
-        bot.send_message(call.from_user.id, "Majburiy kanal qo'shish uchun kanal usernameni (@kanal) yuboring yoki kanalingiz admin ekanligiga ishonch hosil qiling.")
-        user_state[call.from_user.id] = {"step":"settings_channel"}
+        send_channel_menu(call.from_user.id)
     elif action == "add_clinic":
         start_add_clinic(call.from_user.id)
     elif action == "add_doctor":
@@ -566,6 +597,115 @@ def cb_settings(call: types.CallbackQuery):
         send_clinic_picker(call.from_user.id, "O'chirish uchun klinikani tanlang:", "settings|del_clinic_ask")
     elif action == "del_doctor":
         send_doctor_picker(call.from_user.id, "O'chirish uchun doktorni tanlang:", "settings|del_doctor_ask")
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings|channel_add")
+def cb_channel_add(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    user_state[call.from_user.id] = {"step": "settings_channel_add", "data": {}}
+    bot.send_message(
+        call.from_user.id,
+        "Kanal username yoki ID sini yuboring.\nMasalan: @kanal_nomi\n\nEslatma: bot o'sha kanalda admin bo'lishi kerak.",
+    )
+
+@bot.callback_query_handler(func=lambda c: c.data == "settings|channel_list")
+def cb_channel_list(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    send_channel_list(call.from_user.id)
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|channel_stats|"))
+def cb_channel_stats(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    chat_id = call.data.split("|", 2)[2]
+    channel = mandatory_channels.get(chat_id)
+    if not channel:
+        bot.send_message(call.from_user.id, "Kanal topilmadi.")
+        return
+    bot.send_message(call.from_user.id, channel_stats_text(channel), parse_mode="HTML")
+    save_data()
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|channel_users|"))
+def cb_channel_users(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    chat_id = call.data.split("|", 2)[2]
+    channel = mandatory_channels.get(chat_id)
+    if not channel:
+        bot.send_message(call.from_user.id, "Kanal topilmadi.")
+        return
+    rows = []
+    for uid, per_channel in channel_user_stats.items():
+        row = per_channel.get(chat_id)
+        if not row:
+            continue
+        rows.append({
+            "user_id": uid,
+            "is_subscribed": row.get("is_subscribed"),
+            "status": row.get("status"),
+            "checked_at": row.get("checked_at"),
+            "first_subscribed_at": row.get("first_subscribed_at"),
+            "last_subscribed_at": row.get("last_subscribed_at"),
+        })
+    if not rows:
+        bot.send_message(call.from_user.id, "Bu kanal bo'yicha hali foydalanuvchi tekshirilmagan.")
+        return
+    buf = io.StringIO()
+    fieldnames = ["user_id", "is_subscribed", "status", "checked_at", "first_subscribed_at", "last_subscribed_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    payload = io.BytesIO(buf.getvalue().encode("utf-8"))
+    safe_title = (channel.get("username") or channel.get("title") or "channel").replace("@", "").replace(" ", "_")
+    bot.send_document(call.from_user.id, (f"{safe_title}_users.csv", payload))
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|channel_freeze|"))
+def cb_channel_freeze(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    chat_id = call.data.split("|", 2)[2]
+    channel = set_channel_enabled(chat_id, False)
+    if not channel:
+        bot.send_message(call.from_user.id, "Kanal topilmadi.")
+        return
+    bot.send_message(call.from_user.id, f"⏸ Kanal muzlatildi: {channel.get('title')}")
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|channel_enable|"))
+def cb_channel_enable(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    chat_id = call.data.split("|", 2)[2]
+    channel = set_channel_enabled(chat_id, True)
+    if not channel:
+        bot.send_message(call.from_user.id, "Kanal topilmadi.")
+        return
+    bot.send_message(call.from_user.id, f"▶️ Kanal faollashtirildi: {channel.get('title')}")
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|channel_delete_ask|"))
+def cb_channel_delete_ask(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    chat_id = call.data.split("|", 2)[2]
+    channel = mandatory_channels.get(chat_id)
+    if not channel:
+        bot.send_message(call.from_user.id, "Kanal topilmadi.")
+        return
+    kb = InlineKeyboardMarkup()
+    kb.row(mk("✅ Ha, o'chirish", f"settings|channel_delete_confirm|{chat_id}"), mk("❌ Bekor qilish", "noop"))
+    bot.send_message(call.from_user.id, f"Majburiy kanal o'chirilsinmi?\n{channel.get('title')}", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|channel_delete_confirm|"))
+def cb_channel_delete_confirm(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id): return
+    chat_id = call.data.split("|", 2)[2]
+    channel = delete_mandatory_channel(chat_id)
+    if not channel:
+        bot.send_message(call.from_user.id, "Kanal topilmadi yoki allaqachon o'chirilgan.")
+        return
+    bot.send_message(call.from_user.id, f"✅ Kanal o'chirildi: {channel.get('title')}")
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("settings|add_doctor_clinic|"))
 def cb_add_doctor_clinic(call: types.CallbackQuery):
@@ -711,7 +851,20 @@ def cb_del_doctor_confirm(call: types.CallbackQuery):
     save_data()
     bot.send_message(call.from_user.id, f"✅ Doktor o'chirildi: {doctor_name}\nBog'langan yozuvlar yangilandi: {affected}")
 
-@bot.message_handler(func=lambda m: user_state.get(m.chat.id,{}).get('step') == "settings_channel")
-def mh_settings_channel(m: types.Message):
-    channel = m.text.strip(); user_state.pop(m.chat.id, None)
-    bot.send_message(m.chat.id, f"Majburiy kanal o'rnatildi (nazariy): {channel}")
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id,{}).get('step') == "settings_channel_add")
+def mh_settings_channel_add(m: types.Message):
+    if not is_admin(m.from_user.id): return
+    try:
+        channel = add_mandatory_channel(m.text.strip(), m.from_user.id)
+    except PermissionError as exc:
+        bot.send_message(m.chat.id, f"❌ {exc}")
+        return
+    except Exception:
+        logger.exception("failed to add mandatory channel")
+        bot.send_message(m.chat.id, "❌ Kanal qo'shilmadi. Username/ID to'g'riligini va bot kanalda admin ekanini tekshiring.")
+        return
+    user_state.pop(m.chat.id, None)
+    bot.send_message(
+        m.chat.id,
+        f"✅ Majburiy kanal qo'shildi va faollashtirildi:\n{channel.get('title')}\nObunachilar: {channel.get('last_member_count', '-')}",
+    )
