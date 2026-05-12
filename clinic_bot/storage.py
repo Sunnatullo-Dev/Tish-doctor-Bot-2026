@@ -6,11 +6,66 @@ import sys
 from clinic_bot import shared as s
 
 
+def parse_iso_datetime(value):
+    if not value:
+        return s.datetime.min.replace(tzinfo=s.tz)
+    try:
+        parsed = s.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return s.tz.localize(parsed)
+        return parsed
+    except Exception:
+        return s.datetime.min.replace(tzinfo=s.tz)
+
+
+def restore_active_diagnosis_chats():
+    s.active_diag_chats.clear()
+    s.admin_active_diag.clear()
+
+    candidates = []
+    for req_id, req in s.diagnosis_requests.items():
+        if req.get("type", "sms") != "sms":
+            continue
+        if req.get("status") != "assigned":
+            continue
+        user_chat = req.get("user_chat")
+        assigned_admin = req.get("assigned_admin")
+        if user_chat is None or assigned_admin is None:
+            continue
+        try:
+            user_chat = int(user_chat)
+            assigned_admin = int(assigned_admin)
+        except (TypeError, ValueError):
+            s.logger.warning("Skipping diagnosis chat restore for %s: invalid user/admin ids", req_id)
+            continue
+        if assigned_admin not in s.admins:
+            s.logger.warning("Skipping diagnosis chat restore for %s: admin %s is not active", req_id, assigned_admin)
+            continue
+        candidates.append((parse_iso_datetime(req.get("created_at")), req_id, user_chat, assigned_admin))
+
+    restored = 0
+    used_users = set()
+    used_admins = set()
+    for _, req_id, user_chat, assigned_admin in sorted(candidates, reverse=True):
+        if user_chat in used_users or assigned_admin in used_admins:
+            s.logger.warning("Skipping duplicate active diagnosis chat during restore: %s", req_id)
+            continue
+        s.active_diag_chats[user_chat] = assigned_admin
+        s.admin_active_diag[assigned_admin] = user_chat
+        used_users.add(user_chat)
+        used_admins.add(assigned_admin)
+        restored += 1
+
+    s.logger.info("Restored active diagnosis chats: %s", restored)
+    return restored
+
+
 def load_data():
     with s.data_lock:
         if not s.os.path.exists(s.DATA_FILE):
             s.logger.info("No data file found ? using defaults")
             s.data_loaded_successfully = True
+            restore_active_diagnosis_chats()
             return
         try:
             with open(s.DATA_FILE, "r", encoding="utf-8") as f:
@@ -38,8 +93,13 @@ def load_data():
 
             s.admin_history[:] = data.get("admin_history", s.admin_history)
 
+            loaded_diagnosis = data.get("diagnosis_requests", {})
             s.diagnosis_requests.clear()
-            s.diagnosis_requests.update(data.get("diagnosis_requests", {}))
+            if isinstance(loaded_diagnosis, dict):
+                s.diagnosis_requests.update(loaded_diagnosis)
+            else:
+                s.logger.warning("Ignoring invalid diagnosis_requests data")
+            restore_active_diagnosis_chats()
 
             s.mandatory_channels.clear()
             s.mandatory_channels.update(data.get("mandatory_channels", {}))
