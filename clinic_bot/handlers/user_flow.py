@@ -2,19 +2,108 @@ from clinic_bot.shared import *
 from clinic_bot.channel_gate import ensure_user_subscribed
 from clinic_bot.helpers import *
 from clinic_bot.keyboards import date_buttons, time_buttons
-from clinic_bot.scheduler_jobs import schedule_reminder
+from clinic_bot.scheduler_jobs import cancel_appointment_jobs, schedule_reminder
 from clinic_bot.storage import save_data
 
 # ---------------- HANDLERS ----------------
 
+def get_main_clinic():
+    return clinics[0] if clinics else None
+
+
 def send_main_menu(chat, name=""):
     greet = f"Assalomu Aleykum {name}" if name else "Assalomu Aleykum"
     kb = InlineKeyboardMarkup()
-    kb.row(mk("Qabulga yozilish", "flow|booking"), mk("Men doktorman", "flow|doctor"))
-    kb.row(mk("Klinikalar ro'yxati", "list_clinics"), mk("Mening yozuvlarim", "flow|my_appts"))
-    kb.row(mk("Onlay tashhis", "diag_menu"))
-    send_random_sticker(chat)
+    kb.row(mk("📅 Qabulga yozilish", "flow|booking"))
+    kb.row(mk("📋 Mening yozuvlarim", "flow|my_appts"), mk("🩺 Onlay tashhis", "diag_menu"))
+    clinic = get_main_clinic()
+    if clinic:
+        kb.row(mk("🏥 Klinika haqida", f"contact|{clinic['id']}"))
+    kb.row(mk("ℹ️ Yordam", "show_help"))
     bot.send_message(chat, f"<b>{greet}</b>\n\nQuyidagilardan birini tanlang:", parse_mode="HTML", reply_markup=kb)
+
+
+STATUS_LABELS = {
+    'pending': '⏳ Kutilmoqda',
+    'accepted': '✅ Qabul qilingan',
+    'accepted_by_doctor': '✅ Doktor tasdiqladi',
+    'reschedule_requested': '🔁 Vaqt o\'zgartirish so\'raldi',
+    'rescheduled_by_admin': '🔁 Admin yangiladi',
+    'rescheduled_by_patient': '🔁 Bemor yangiladi',
+    'rescheduled_by_doctor': '🔁 Doktor yangiladi',
+    'cancelled': '❌ Bekor qilingan',
+    'cancelled_clinic_deleted': '❌ Klinika o\'chirilgan',
+    'cancelled_doctor_deleted': '❌ Doktor o\'chirilgan',
+    'completed': '✔️ Yakunlangan',
+}
+
+
+def _appt_status_label(status):
+    return STATUS_LABELS.get(status, status or '-')
+
+
+def send_user_appointments(chat):
+    user_appts = [a for a in appointments.values() if a.get('patient_chat') == chat]
+    if not user_appts:
+        bot.send_message(chat, "Sizda yozuvlar mavjud emas.", reply_markup=with_home_kb([[mk("📅 Yangi bron", "flow|booking")]]))
+        return
+    now_dt = datetime.now(tz)
+    upcoming = [a for a in user_appts if a.get('datetime') and a['datetime'] >= now_dt and not str(a.get('status','')).startswith('cancelled')]
+    past = [a for a in user_appts if a.get('datetime') and a['datetime'] < now_dt and not str(a.get('status','')).startswith('cancelled')]
+    cancelled = [a for a in user_appts if str(a.get('status','')).startswith('cancelled')]
+
+    def _render(appt, can_modify):
+        doc = appt.get('doctor_obj'); clinic = appt.get('clinic')
+        text = (
+            f"📌 ID: <code>{appt['id']}</code>\n"
+            f"🏥 {clinic['name'] if clinic else '---'}\n"
+            f"👨‍⚕️ {doc['name'] if doc else '---'}\n"
+            f"⏰ {fmt_datetime_readable(appt.get('datetime'))}\n"
+            f"📍 {_appt_status_label(appt.get('status'))}"
+        )
+        kb = InlineKeyboardMarkup()
+        if can_modify:
+            kb.row(mk("❌ Bekor qilish", f"appt|cancel|{appt['id']}"), mk("🔁 Vaqtni o'zgartirish", f"appt|reschedule|{appt['id']}"))
+        kb.row(mk("☎️ Telefonni ko'rish", f"phone_req|{appt['id']}"))
+        bot.send_message(chat, text, parse_mode="HTML", reply_markup=kb)
+
+    if upcoming:
+        bot.send_message(chat, "<b>🔵 Kutilayotgan yozuvlar:</b>", parse_mode="HTML")
+        for a in sorted(upcoming, key=lambda x: x.get('datetime')):
+            _render(a, can_modify=True)
+    if past:
+        bot.send_message(chat, "<b>✔️ O'tgan yozuvlar:</b>", parse_mode="HTML")
+        for a in sorted(past, key=lambda x: x.get('datetime'), reverse=True)[:10]:
+            _render(a, can_modify=False)
+    if cancelled:
+        bot.send_message(chat, "<b>❌ Bekor qilinganlar:</b>", parse_mode="HTML")
+        for a in sorted(cancelled, key=lambda x: x.get('datetime') or now_dt, reverse=True)[:5]:
+            _render(a, can_modify=False)
+    bot.send_message(chat, "—", reply_markup=with_home_kb([[mk("📅 Yangi bron", "flow|booking")]]))
+
+
+def send_doctor_picker(chat):
+    clinic = get_main_clinic()
+    if not clinic:
+        bot.send_message(chat, "Hozircha klinika ma'lumotlari mavjud emas. Iltimos keyinroq urinib ko'ring.", reply_markup=with_home_kb())
+        return
+    user_state.setdefault(chat, {})['data'] = {'clinic': clinic}
+    user_state[chat]['step'] = "choosing_doctor"
+    txt = f"🏥 <b>{clinic['name']}</b>\n{clinic.get('address','')}\n☎️ {clinic.get('manager_phone','')}\n\n<b>Doktorni tanlang:</b>"
+    kb = InlineKeyboardMarkup()
+    doctors = clinic.get('doctors') or []
+    if doctors:
+        for d in doctors:
+            specialty = d.get('specialty') or d.get('experience') or ''
+            label = f"👨‍⚕️ Dr. {d['name']}"
+            if specialty:
+                label += f" • {specialty}"
+            kb.add(mk(label, f"doctor|{d['id']}|{clinic['id']}"))
+    else:
+        kb.add(mk("Hozircha doktorlar yo'q", "nodoc"))
+    kb.row(mk("☎️ Klinika bilan bog'lanish", f"contact|{clinic['id']}"))
+    kb.row(home_button())
+    bot.send_message(chat, txt, parse_mode="HTML", reply_markup=kb)
 
 
 # /start
@@ -37,6 +126,28 @@ def cmd_start(m: types.Message):
     send_main_menu(chat, name)
     save_data()
 
+HELP_TEXT = (
+    "ℹ️ <b>Yordam / FAQ</b>\n\n"
+    "<b>Qabulga yozilish:</b> Bosh menyudan \"Qabulga yozilish\" → doktorni tanlang → sanani tanlang → vaqtni tanlang → ism va telefon kiriting → tasdiqlang.\n\n"
+    "<b>Mening yozuvlarim:</b> Sizning kelajakdagi, o'tgan va bekor qilingan yozuvlaringiz ko'rinadi.\n\n"
+    "<b>Onlay tashhis:</b> Adminga matn yoki suhbat orqali murojaat qiling.\n\n"
+    "<b>Eslatma:</b> Uchrashuvdan 1 soat oldin avtomatik eslatma yuboriladi.\n\n"
+    "<b>Bron bekor qilish:</b> \"Mening yozuvlarim\" dan kerakli yozuv ostidagi tugmadan foydalaning.\n\n"
+    "Savollar uchun klinika bilan bog'laning."
+)
+
+
+@bot.message_handler(commands=['help'])
+def cmd_help(m: types.Message):
+    bot.send_message(m.chat.id, HELP_TEXT, parse_mode="HTML", reply_markup=with_home_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "show_help")
+def cb_show_help(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, HELP_TEXT, parse_mode="HTML", reply_markup=with_home_kb())
+
+
 @bot.callback_query_handler(func=lambda c: c.data == "check_subscriptions")
 def cb_check_subscriptions(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
@@ -48,7 +159,7 @@ def cb_check_subscriptions(call: types.CallbackQuery):
     user_state[chat] = {"step":"start", "data":{}}
     send_main_menu(chat, name)
 
-# Flow buttons (booking/doctor/help/my_appts)
+# Flow buttons (booking/my_appts)
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("flow|"))
 def cb_flow(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
@@ -57,30 +168,10 @@ def cb_flow(call: types.CallbackQuery):
         return
     action = call.data.split("|",1)[1]
     if action == "booking":
-        user_state[chat] = {"step":"booking_start", "data":{}}
-        kb = InlineKeyboardMarkup()
-        kb.row(mk("🏥 Klinikalar ro'yxati", "list_clinics"))
-        bot.send_message(chat, "Klinikani tanlang:", reply_markup=kb)
-        return
-    if action == "doctor":
-        user_state[chat] = {"step":"doc_choose_clinic", "data":{}}
-        kb = InlineKeyboardMarkup()
-        for c in clinics:
-            kb.add(mk(f"{c['name']} ({c['region']})", f"docreg|clinic|{c['id']}"))
-        kb.row(mk("Boshqa klinika (yozaman)", "docreg|clinic|other"))
-        bot.send_message(chat, "Qaysi klinikada ishlaysiz? Tanlang:", reply_markup=kb)
+        send_doctor_picker(chat)
         return
     if action == "my_appts":
-        user_appts = [a for a in appointments.values() if a['patient_chat']==chat]
-        if not user_appts:
-            bot.send_message(chat, "Sizda yozuvlar mavjud emas.")
-            return
-        for a in sorted(user_appts, key=lambda x: x.get('datetime') or datetime.now(tz)):
-            doc = a.get('doctor_obj'); clinic = a.get('clinic')
-            kb = InlineKeyboardMarkup()
-            kb.row(mk("❌ Bekor qilish", f"appt|cancel|{a['id']}"), mk("🔁 Vaqtni o'zgartirish", f"appt|reschedule|{a['id']}"))
-            kb.row(mk("📱 Telefonni yuborish", f"phone_req|{a['id']}"))
-            bot.send_message(chat, f"📌 ID: {a['id']}\nKlinika: {clinic['name'] if clinic else '---'}\nDoctor: {doc['name'] if doc else '---'}\nVaqt: {fmt_datetime_readable(a.get('datetime'))}\nHolat: {a.get('status')}", reply_markup=kb)
+        send_user_appointments(chat)
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("phone_req|"))
 def cb_phone_req(call: types.CallbackQuery):
@@ -91,19 +182,16 @@ def cb_phone_req(call: types.CallbackQuery):
         bot.send_message(call.message.chat.id, "Yozuv topilmadi.")
         return
     phone = appt.get("patient_phone") or "Telefon kiritilmagan"
-    bot.send_message(call.message.chat.id, f"Ushbu yozuvdagi telefon: {phone}")
+    bot.send_message(call.message.chat.id, f"☎️ Saqlangan telefon: <code>{phone}</code>", parse_mode="HTML")
 
-# list clinics
+# legacy callback: just show the single clinic's doctors
 @bot.callback_query_handler(func=lambda c: c.data == "list_clinics")
 def cb_list_clinics(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
     chat = call.message.chat.id
     if not ensure_user_subscribed(chat, call.from_user.id):
         return
-    kb = InlineKeyboardMarkup()
-    for c in clinics:
-        kb.add(mk(f"{c['name']} — {c['address']}", f"clinic|{c['id']}"))
-    bot.send_message(chat, "Klinikani tanlang:", reply_markup=kb)
+    send_doctor_picker(chat)
 
 # clinic selection
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("clinic|"))
@@ -120,32 +208,48 @@ def cb_clinic(call: types.CallbackQuery):
     user_state.setdefault(chat, {})['data'] = user_state.get(chat, {}).get('data', {})
     user_state[chat]['data']['clinic'] = clinic
     user_state[chat]['step'] = "choosing_doctor"
-    txt = f"🏥 <b>{clinic['name']}</b>\n{clinic['address']}\n📞 {clinic['manager_phone']}\n\n<b>Doktorlar:</b>"
+    txt = f"🏥 <b>{clinic['name']}</b>\n{clinic['address']}\n☎️ {clinic['manager_phone']}\n\n<b>Doktorlar:</b>"
     kb = InlineKeyboardMarkup()
     if clinic['doctors']:
         for d in clinic['doctors']:
-            kb.add(mk(f"{d['name']} — {d.get('experience','')}", f"doctor|{d['id']}|{clinic['id']}"))
+            specialty = d.get('specialty') or d.get('experience','')
+            label = f"👨‍⚕️ Dr. {d['name']}"
+            if specialty:
+                label += f" • {specialty}"
+            kb.add(mk(label, f"doctor|{d['id']}|{clinic['id']}"))
     else:
         kb.add(mk("Hozircha doktorlar yo'q", "nodoc"))
-    kb.row(mk("📞 Klinika bilan bog'lanish", f"contact|{clinic['id']}"))
+    kb.row(mk("☎️ Klinika bilan bog'lanish", f"contact|{clinic['id']}"))
     bot.send_message(chat, txt, parse_mode="HTML", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data == "nodoc")
 def cb_nodoc(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, "Bu klinikada hozir doktorlar yo'q. Agar siz doktor bo'lsangiz 'Men doktorman' orqali ro'yxatdan o'ting.")
+    bot.send_message(call.message.chat.id, "Bu klinikada hozir doktorlar yo'q.", reply_markup=with_home_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("contact|"))
 def cb_contact(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
-    if not ensure_user_subscribed(call.message.chat.id, call.from_user.id):
+    chat = call.message.chat.id
+    if not ensure_user_subscribed(chat, call.from_user.id):
         return
     cid = call.data.split("|",1)[1]
     clinic = find_clinic_by_id(cid)
-    if clinic:
-        bot.send_message(call.message.chat.id, f"📞 Klinika raqami: {clinic['manager_phone']}")
-    else:
-        bot.send_message(call.message.chat.id, "Klinika topilmadi.")
+    if not clinic:
+        bot.send_message(chat, "Klinika topilmadi.")
+        return
+    bot.send_message(
+        chat,
+        f"🏥 <b>{clinic.get('name','-')}</b>\n📍 {clinic.get('address','-')}\n☎️ <code>{clinic.get('manager_phone','-')}</code>",
+        parse_mode="HTML"
+    )
+    lat = clinic.get('lat'); lon = clinic.get('lon')
+    if lat and lon:
+        try:
+            bot.send_location(chat, latitude=float(lat), longitude=float(lon))
+        except Exception:
+            logger.exception("send_location failed")
+    bot.send_message(chat, "—", reply_markup=with_home_kb())
 
 @bot.callback_query_handler(func=lambda c: c.data == "noop")
 def cb_noop(call: types.CallbackQuery):
@@ -158,10 +262,7 @@ def cb_back(call: types.CallbackQuery):
     target = call.data.split("|", 1)[1]
     st = user_state.get(chat, {})
     if target == "to_clinic":
-        kb = InlineKeyboardMarkup()
-        for c in clinics:
-            kb.add(mk(f"{c['name']} ({c['region']})", f"clinic|{c['id']}"))
-        bot.send_message(chat, "Klinikani tanlang:", reply_markup=kb)
+        send_doctor_picker(chat)
         return
     if target == "to_date":
         step = st.get("step")
@@ -196,7 +297,17 @@ def cb_doctor(call: types.CallbackQuery):
     user_state[chat]['data']['clinic'] = clinic
     user_state[chat]['data']['doctor'] = doctor
     user_state[chat]['step'] = "choosing_date"
-    caption = f"👨‍⚕️ <b>{doctor['name']}</b>\nTajriba: {doctor.get('experience','')}\nNarxi: {doctor.get('price','kelishiladi')}\nReyting: {round(get_doctor_rating(doctor),1)}"
+    wh = doctor.get('working_hours') or {}
+    wh_line = f"\nIsh vaqti: {wh.get('start','09:00')}-{wh.get('end','19:00')}" if wh else ""
+    specialty_line = f"\nMutaxassislik: {doctor.get('specialty')}" if doctor.get('specialty') else ""
+    caption = (
+        f"👨‍⚕️ <b>{doctor['name']}</b>"
+        f"{specialty_line}\n"
+        f"Tajriba: {doctor.get('experience','')}\n"
+        f"Narxi: {doctor.get('price','kelishiladi')}\n"
+        f"Reyting: {round(get_doctor_rating(doctor),1)}⭐"
+        f"{wh_line}"
+    )
     if doctor.get('photo_file_id'):
         try:
             bot.send_photo(chat, doctor['photo_file_id'], caption=caption, parse_mode="HTML")
@@ -224,22 +335,29 @@ def cb_date_time(call: types.CallbackQuery):
         if step == "choosing_date":
             data['chosen_date'] = chosen_date
             st['step'] = "choosing_time"
-            bot.send_message(chat, "⏰ Vaqt tanlang:", reply_markup=time_buttons(chosen_date))
+            doctor = data.get('doctor')
+            bot.send_message(chat, "⏰ Vaqt tanlang:", reply_markup=time_buttons(chosen_date, doctor=doctor))
             return
         if step == "admin_reschedule_choose_date":
             st['data']['chosen_date'] = chosen_date
             st['step'] = "admin_reschedule_choose_time"
-            bot.send_message(chat, "Admin: vaqtni tanlang:", reply_markup=time_buttons(chosen_date))
+            appt = appointments.get(st['data'].get('appt_id'))
+            doctor = (appt or {}).get('doctor_obj')
+            bot.send_message(chat, "Admin: vaqtni tanlang:", reply_markup=time_buttons(chosen_date, doctor=doctor, exclude_appt_id=st['data'].get('appt_id')))
             return
         if step == "patient_reschedule_choose_date":
             st['data']['chosen_date'] = chosen_date
             st['step'] = "patient_reschedule_choose_time"
-            bot.send_message(chat, "Yangi vaqtni tanlang:", reply_markup=time_buttons(chosen_date))
+            appt = appointments.get(st['data'].get('appt_id'))
+            doctor = (appt or {}).get('doctor_obj')
+            bot.send_message(chat, "Yangi vaqtni tanlang:", reply_markup=time_buttons(chosen_date, doctor=doctor, exclude_appt_id=st['data'].get('appt_id')))
             return
         if step == "doc_reschedule_choose_date":
             st['data']['chosen_date'] = chosen_date
             st['step'] = "doc_reschedule_choose_time"
-            bot.send_message(chat, "Doctor: vaqtni tanlang:", reply_markup=time_buttons(chosen_date))
+            appt = appointments.get(st['data'].get('appt_id'))
+            doctor = (appt or {}).get('doctor_obj')
+            bot.send_message(chat, "Doctor: vaqtni tanlang:", reply_markup=time_buttons(chosen_date, doctor=doctor, exclude_appt_id=st['data'].get('appt_id')))
             return
         return
     # TIME
@@ -253,8 +371,12 @@ def cb_date_time(call: types.CallbackQuery):
             chosen_date = data.get('chosen_date')
             if not chosen_date:
                 bot.send_message(chat, "Sana topilmadi."); return
+            doctor = data.get('doctor')
             dt_local = datetime.combine(chosen_date, time(hh, mm))
             dt_local = tz.localize(dt_local)
+            if doctor and is_slot_taken(doctor.get('id'), dt_local):
+                bot.send_message(chat, "⛔ Bu vaqt allaqachon band qilingan. Boshqa vaqtni tanlang:", reply_markup=time_buttons(chosen_date, doctor=doctor))
+                return
             data['datetime'] = dt_local
             st['step'] = "confirm_time"
             kb = InlineKeyboardMarkup()
@@ -271,6 +393,10 @@ def cb_date_time(call: types.CallbackQuery):
             if not chosen_date:
                 bot.send_message(chat, "Sana topilmadi."); return
             dt_local = tz.localize(datetime.combine(chosen_date, time(hh, mm)))
+            doc = appt.get('doctor_obj')
+            if doc and is_slot_taken(doc.get('id'), dt_local, exclude_appt_id=appt_id):
+                bot.send_message(chat, "⛔ Bu vaqt allaqachon band. Boshqa vaqt tanlang:", reply_markup=time_buttons(chosen_date, doctor=doc, exclude_appt_id=appt_id))
+                return
             appt['datetime'] = dt_local; appt['status'] = "rescheduled_by_admin"
             try: bot.send_message(appt['patient_chat'], f"Sizning uchrashuvingiz admin tomonidan yangi vaqtda belgilandi: {fmt_datetime_readable(dt_local)}.")
             except Exception: logger.exception("notify patient failed")
@@ -285,6 +411,10 @@ def cb_date_time(call: types.CallbackQuery):
             if not appt:
                 bot.send_message(chat, "Buyurtma topilmadi."); user_state.pop(chat, None); return
             chosen_date = st['data'].get('chosen_date'); dt_local = tz.localize(datetime.combine(chosen_date, time(hh, mm)))
+            doc = appt.get('doctor_obj')
+            if doc and is_slot_taken(doc.get('id'), dt_local, exclude_appt_id=appt_id):
+                bot.send_message(chat, "⛔ Bu vaqt allaqachon band. Boshqa vaqt tanlang:", reply_markup=time_buttons(chosen_date, doctor=doc, exclude_appt_id=appt_id))
+                return
             appt['datetime'] = dt_local; appt['status'] = "rescheduled_by_patient"
             try: bot.send_message(chat, f"Vaqt o'zgartirildi: {fmt_datetime_readable(dt_local)}. Doktor va adminga xabar yuborildi.")
             except Exception: logger.exception("notify patient failed")
@@ -300,6 +430,10 @@ def cb_date_time(call: types.CallbackQuery):
             if not appt:
                 bot.send_message(chat, "Buyurtma topilmadi."); user_state.pop(chat, None); return
             chosen_date = st['data'].get('chosen_date'); dt_local = tz.localize(datetime.combine(chosen_date, time(hh, mm)))
+            doc = appt.get('doctor_obj')
+            if doc and is_slot_taken(doc.get('id'), dt_local, exclude_appt_id=appt_id):
+                bot.send_message(chat, "⛔ Bu vaqt allaqachon band. Boshqa vaqt tanlang:", reply_markup=time_buttons(chosen_date, doctor=doc, exclude_appt_id=appt_id))
+                return
             appt['datetime'] = dt_local; appt['status'] = "rescheduled_by_doctor"
             try: bot.send_message(appt['patient_chat'], f"Doktor tomonidan yangi vaqt belgilandi: {fmt_datetime_readable(dt_local)}")
             except Exception: logger.exception("notify patient failed")
@@ -316,7 +450,7 @@ def cb_time_confirm(call: types.CallbackQuery):
         bot.send_message(chat, "Hech qanday tasdiqlanayotgan vaqt topilmadi."); return
     if ans == "yes":
         user_state[chat]['step'] = "enter_name"
-        bot.send_message(chat, "Vaqt tasdiqlandi ✅\nIltimos ismingizni kiriting (yoki 'o'tkazish'):")
+        bot.send_message(chat, "Vaqt tasdiqlandi ✅\nIltimos ismingizni kiriting (yoki 'o'tkazish'):", reply_markup=cancel_kb())
     else:
         user_state[chat]['step'] = "choosing_date"
         bot.send_message(chat, "Yaxshi, qayta sana tanlang:", reply_markup=date_buttons(14))
@@ -325,7 +459,10 @@ def cb_time_confirm(call: types.CallbackQuery):
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get('step') == "enter_name")
 def mh_enter_name(m: types.Message):
     chat = m.chat.id
-    txt = m.text.strip()
+    txt = (m.text or "").strip()
+    if not txt:
+        bot.send_message(chat, "Iltimos ismingizni matn ko'rinishida kiriting (yoki 'o'tkazish'):", reply_markup=cancel_kb())
+        return
     if txt.lower() in ["yoq","bekor","no","cancel","o'tkazish","otkazish"]:
         user_state[chat]['data']['patient_name'] = "Anonim"
     else:
@@ -333,6 +470,7 @@ def mh_enter_name(m: types.Message):
     user_state[chat]['step'] = "enter_phone"
     kb = InlineKeyboardMarkup()
     kb.row(mk("📱 Avtomatik yuborish", "phone_choice|auto"), mk("✍️ Qo'lda kiritish", "phone_choice|manual"))
+    kb.row(cancel_button())
     bot.send_message(chat, "Telefonni qanday yubormoqchisiz?", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("phone_choice|"))
@@ -347,7 +485,7 @@ def cb_phone_choice(call: types.CallbackQuery):
         user_state[chat]['step'] = "await_contact_auto"
     else:
         user_state[chat]['step'] = "await_contact_manual"
-        bot.send_message(chat, "Iltimos telefon raqamingizni matn ko'rinishida yuboring (masalan +998901234567):")
+        bot.send_message(chat, "Iltimos telefon raqamingizni matn ko'rinishida yuboring.\nFormat: +998901234567", reply_markup=cancel_kb())
 
 @bot.message_handler(
     func=lambda m: (
@@ -360,13 +498,15 @@ def mh_contact(m: types.Message):
     chat = m.chat.id
     st = user_state.get(chat, {})
     if st and st.get('step') == "await_contact_auto":
-        phone = m.contact.phone_number
+        raw = m.contact.phone_number if m.contact else None
+        phone = normalize_phone(raw) or raw  # contact phones are trusted
         user_state[chat]['data']['patient_phone'] = phone
-        create_appointment_from_state(chat)
+        bot.send_message(chat, "✅ Telefon qabul qilindi.", reply_markup=types.ReplyKeyboardRemove())
+        show_booking_summary(chat)
         return
     # admin add via contact
     if m.from_user.id in admin_add_state and admin_add_state[m.from_user.id] == "await_admin_id":
-        if m.contact.user_id:
+        if m.contact and m.contact.user_id:
             new_admin = m.contact.user_id
             admins.add(new_admin)
             admin_history.append({"added_by": m.from_user.id, "new_admin": new_admin, "ts": datetime.now(tz).isoformat()})
@@ -374,16 +514,100 @@ def mh_contact(m: types.Message):
             bot.send_message(m.chat.id, f"✅ {new_admin} adminlarga qo'shildi.")
             save_data()
             return
+        bot.send_message(m.chat.id, "❌ Ushbu kontaktda Telegram ID topilmadi. Iltimos foydalanuvchining raqamli ID sini matn ko'rinishida yuboring.")
+        return
 
-@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get('step') == "await_contact_manual")
+@bot.message_handler(
+    func=lambda m: user_state.get(m.chat.id, {}).get('step') == "await_contact_manual",
+    content_types=['text', 'contact']
+)
 def mh_contact_manual(m: types.Message):
     chat = m.chat.id
-    phone = m.text.strip()
+    if m.content_type == 'contact' and m.contact and m.contact.phone_number:
+        phone = normalize_phone(m.contact.phone_number) or m.contact.phone_number
+    else:
+        raw = (m.text or "").strip()
+        if not raw:
+            bot.send_message(chat, "Telefon raqamingizni yuboring (masalan +998901234567):", reply_markup=cancel_kb())
+            return
+        phone = normalize_phone(raw)
+        if not phone:
+            bot.send_message(chat, "❌ Telefon raqam noto'g'ri formatda. To'g'ri format: +998901234567\nQayta kiriting:", reply_markup=cancel_kb())
+            return
     user_state[chat]['data']['patient_phone'] = phone
+    show_booking_summary(chat)
+
+
+def show_booking_summary(chat):
+    st = user_state.get(chat, {})
+    data = st.get('data', {}) if st else {}
+    clinic = data.get('clinic')
+    doctor = data.get('doctor')
+    dt = data.get('datetime')
+    name = data.get('patient_name', '-')
+    phone = data.get('patient_phone', '-')
+    text = (
+        "📋 <b>Buyurtmangizni tekshiring:</b>\n\n"
+        f"🏥 Klinika: <b>{clinic.get('name') if clinic else '-'}</b>\n"
+        f"👨‍⚕️ Doktor: <b>{doctor.get('name') if doctor else '-'}</b>\n"
+        f"📅 Vaqt: <b>{fmt_datetime_readable(dt)}</b>\n"
+        f"👤 Ism: <b>{name}</b>\n"
+        f"☎️ Telefon: <b>{phone}</b>\n\n"
+        "Hammasi to'g'rimi?"
+    )
+    kb = InlineKeyboardMarkup()
+    kb.row(mk("✅ Tasdiqlash", "booking_confirm|yes"), mk("❌ Bekor qilish", "booking_confirm|no"))
+    user_state[chat]['step'] = "booking_confirm"
+    bot.send_message(chat, text, parse_mode="HTML", reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("booking_confirm|"))
+def cb_booking_confirm(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    chat = call.message.chat.id
+    if user_state.get(chat, {}).get('step') != "booking_confirm":
+        bot.send_message(chat, "Tasdiqlanmagan buyurtma topilmadi."); return
+    ans = call.data.split("|", 1)[1]
+    if ans == "no":
+        user_state.pop(chat, None)
+        bot.send_message(chat, "Buyurtma bekor qilindi.", reply_markup=with_home_kb())
+        try:
+            bot.edit_message_reply_markup(chat, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
     create_appointment_from_state(chat)
+    try:
+        bot.edit_message_reply_markup(chat, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "cancel_flow")
+def cb_cancel_flow(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id, "Bekor qilindi")
+    chat = call.message.chat.id
+    user_state.pop(chat, None)
+    bot.send_message(chat, "Amal bekor qilindi.", reply_markup=with_home_kb())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "go_home")
+def cb_go_home(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    chat = call.message.chat.id
+    user_state.pop(chat, None)
+    name = (call.from_user.first_name or "").strip()
+    send_main_menu(chat, name)
 
 def create_appointment_from_state(chat):
     data = user_state[chat]['data']
+    doctor = data.get('doctor')
+    dt = data.get('datetime')
+    # last-second double-booking guard
+    if doctor and dt and is_slot_taken(doctor.get('id'), dt):
+        bot.send_message(chat, "⛔ Afsus, bu vaqt allaqachon band qilindi. Iltimos boshqa vaqt tanlang.", reply_markup=with_home_kb([[mk("📅 Yangi vaqt tanlash", "flow|booking")]]))
+        user_state.pop(chat, None)
+        return
     appt_id = new_id("appt")
     appt = {
         "id": appt_id,
@@ -414,18 +638,14 @@ def create_appointment_from_state(chat):
             bot.send_message(aid, txt, parse_mode="HTML", reply_markup=kb)
         except Exception:
             logger.exception("send to admin failed")
-    bot.send_message(chat, "Sizning so'rovingiz admin ga yuborildi. Javobni kuting.")
-    send_random_sticker(chat)
+    bot.send_message(
+        chat,
+        f"✅ Buyurtmangiz qabul qilindi!\nID: <code>{appt_id}</code>\nAdmin javobini kuting.",
+        parse_mode="HTML",
+        reply_markup=with_home_kb([[mk("📋 Mening yozuvlarim", "flow|my_appts")]])
+    )
     user_state.pop(chat, None)
     save_data()
-
-def cancel_appointment_jobs(appt_id):
-    for job_id in (f"rem_{appt_id}", f"rating_{appt_id}"):
-        try:
-            if scheduler.get_job(job_id):
-                scheduler.remove_job(job_id)
-        except Exception:
-            logger.exception("failed to remove scheduled job %s", job_id)
 
 # Admin handles appointment actions
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("admin|appt|"))
@@ -451,8 +671,8 @@ def cb_admin_appt(call: types.CallbackQuery):
             try:
                 bot.send_message(doc['telegram_id'], f"✅ Sizga yangi uchrashuv: {appt['patient_name']} — {fmt_datetime_readable(appt['datetime'])}",
                                  reply_markup=InlineKeyboardMarkup().row(
-                                     mk("Qabul qilaman", f"doctor|appt|accept|{appt_id}"),
-                                     mk("Vaqtni o'zgartirish", f"doctor|appt|reschedule|{appt_id}")
+                                     mk("✅ Qabul qilaman", f"doctor|appt|accept|{appt_id}"),
+                                     mk("🕑 Vaqtni o'zgartirish", f"doctor|appt|reschedule|{appt_id}")
                                  ))
             except Exception:
                 logger.exception("notify doctor failed")
@@ -472,6 +692,16 @@ def cb_admin_appt(call: types.CallbackQuery):
             bot.send_message(appt['patient_chat'], "Afsus, buyurtmangiz bekor qilindi (admin tomonidan).")
         except Exception:
             logger.exception("notify patient on cancel failed")
+        doc = appt.get('doctor_obj')
+        if doc and doc.get('telegram_id'):
+            try:
+                bot.send_message(doc['telegram_id'], f"❌ Uchrashuv admin tomonidan bekor qilindi: {appt.get('patient_name')} — {fmt_datetime_readable(appt.get('datetime'))}")
+            except Exception:
+                logger.exception("notify doctor on admin cancel failed")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
         save_data()
     elif action == "reschedule":
         user_state[call.from_user.id] = {"step":"admin_reschedule_choose_date", "data":{"appt_id": appt_id}}
@@ -493,11 +723,16 @@ def cb_appt_user(call: types.CallbackQuery):
     if action == "cancel":
         appt['status'] = "cancelled"
         cancel_appointment_jobs(appt_id)
-        bot.send_message(call.message.chat.id, "Yozuv bekor qilindi.")
+        user_state[call.from_user.id] = {"step": "cancel_reason", "data": {"appt_id": appt_id}}
+        bot.send_message(
+            call.message.chat.id,
+            "Yozuv bekor qilindi. Iltimos qisqacha sababni yozing (yoki 'o'tkazish'):",
+            reply_markup=cancel_kb()
+        )
         doc = appt.get('doctor_obj')
         if doc and doc.get('telegram_id'):
             try:
-                bot.send_message(doc['telegram_id'], f"Bemorga bog'liq uchrashuv bekor qilindi: {appt['patient_name']} — {fmt_datetime_readable(appt['datetime'])}")
+                bot.send_message(doc['telegram_id'], f"❌ Bemor uchrashuvni bekor qildi: {appt['patient_name']} — {fmt_datetime_readable(appt['datetime'])}")
             except Exception:
                 logger.exception("notify doctor on cancel failed")
         save_data()
@@ -540,24 +775,45 @@ def cb_rate(call: types.CallbackQuery):
     appt['rated'] = True
     bot.send_message(call.message.chat.id, "Rahmat! Bahoyingiz qabul qilindi.")
     user_state[call.message.chat.id] = {"step":"leave_review","data":{"appt_id":appt_id}}
-    bot.send_message(call.message.chat.id, "Agar xohlasangiz qisqacha fikringizni yozing (yoki 'o'tkazish'):")
+    bot.send_message(call.message.chat.id, "Agar xohlasangiz qisqacha fikringizni yozing (yoki 'o'tkazish'):", reply_markup=cancel_kb())
     save_data()
+
+
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get('step') == "cancel_reason")
+def mh_cancel_reason(m: types.Message):
+    chat = m.chat.id
+    txt = (m.text or "").strip()
+    st = user_state.get(chat, {})
+    appt_id = st.get('data', {}).get('appt_id')
+    user_state.pop(chat, None)
+    if txt.lower() not in ("o'tkazish", "otkazish", "skip", "yoq", "yo'q", "-"):
+        appt = appointments.get(appt_id)
+        if appt:
+            appt['cancel_reason'] = txt
+            appt['cancel_reason_at'] = datetime.now(tz).isoformat()
+            save_data()
+            for aid in list(admins):
+                try:
+                    bot.send_message(aid, f"📝 Bemor bekor qilish sababi ({appt_id}): {txt}")
+                except Exception:
+                    pass
+    bot.send_message(chat, "Rahmat. Tushunchangiz uchun minnatdormiz.", reply_markup=with_home_kb())
 
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get('step') == "leave_review")
 def mh_leave_review(m: types.Message):
-    chat = m.chat.id; txt = m.text.strip()
+    chat = m.chat.id; txt = (m.text or "").strip()
     st = user_state.get(chat)
     if not st:
         return
     appt_id = st['data'].get('appt_id')
     appt = appointments.get(appt_id)
     if not appt:
-        bot.send_message(chat, "Buyurtma topilmadi."); user_state.pop(chat,None); return
+        bot.send_message(chat, "Buyurtma topilmadi.", reply_markup=with_home_kb()); user_state.pop(chat,None); return
     doc = appt.get('doctor_obj')
-    if doc is not None and txt.lower() not in ("o'tkazish","otkazish","skip"):
+    if doc is not None and txt and txt.lower() not in ("o'tkazish","otkazish","skip"):
         doc.setdefault('reviews', []).append({"from": chat, "text": txt, "date": datetime.now(tz).isoformat()})
-        bot.send_message(chat, "Rahmat! Fikringiz qabul qilindi.")
+        bot.send_message(chat, "Rahmat! Fikringiz qabul qilindi.", reply_markup=with_home_kb())
     else:
-        bot.send_message(chat, "Rahmat!")
+        bot.send_message(chat, "Rahmat!", reply_markup=with_home_kb())
     user_state.pop(chat,None)
     save_data()

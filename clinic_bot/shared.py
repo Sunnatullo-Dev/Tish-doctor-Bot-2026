@@ -104,8 +104,14 @@ diagnosis_requests = {}     # req_id -> dict (ticket system)
 mandatory_channels = {}     # channel_key -> channel config/status dict
 channel_user_stats = {}     # user_id(str) -> channel_key -> latest membership/check data
 # each diagnosis_requests[req_id] includes: notify_msgs: list of {"admin_id", "chat_id", "message_id"}
-active_diag_chats = {}      # user_chat -> admin_id
+active_diag_chats = {}      # user_chat -> admin_id (legacy admin-user chat)
 admin_active_diag = {}      # admin_id -> user_chat
+
+# Doctor <-> user diagnostic chat (new)
+active_doctor_chats = {}    # user_chat -> doctor_telegram_id
+doctor_active_chats = {}    # doctor_telegram_id -> user_chat
+diag_chat_mode = {}         # user_chat -> "sms" | "call"
+diag_chat_req = {}          # user_chat -> req_id
 
 admin_ad_state = {}         # admin_id -> "await_ad_text"
 admin_add_state = {}        # admin_id -> "await_admin_id"

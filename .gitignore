@@ -3,3 +3,5 @@ __pycache__/
 .env
 clinic_bot_data_final.json
 clinic_bot_data_final.json.*
+.codex/
+*.tmp

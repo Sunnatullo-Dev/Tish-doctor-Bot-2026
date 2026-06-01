@@ -85,8 +85,19 @@ def schedule_reminder(appt_id):
         return False
     if appt_dt.tzinfo is None:
         appt_dt = tz.localize(appt_dt)
-    remind_time = appt_dt - timedelta(hours=1)
-    if remind_time > datetime.now(tz):
+    now = datetime.now(tz)
+    # reminder offset: per-clinic config (hours), default 1h
+    clinic = appt.get('clinic') or (clinics[0] if clinics else {})
+    try:
+        hours_before = float(clinic.get('reminder_hours_before', 1))
+    except Exception:
+        hours_before = 1
+    remind_time = appt_dt - timedelta(hours=hours_before)
+    # If preferred remind_time already passed but appointment is still in the future
+    # by at least 5 minutes, send a short-notice reminder soon.
+    if remind_time <= now and appt_dt - now >= timedelta(minutes=5):
+        remind_time = now + timedelta(minutes=1)
+    if remind_time > now:
         try:
             scheduler.add_job(send_reminder_job, 'date', run_date=remind_time, args=[appt_id], id=job_id)
             logger.info("Scheduled reminder %s -> %s", appt_id, remind_time.isoformat())

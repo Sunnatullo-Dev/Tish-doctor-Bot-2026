@@ -21,8 +21,13 @@ def parse_iso_datetime(value):
 def restore_active_diagnosis_chats():
     s.active_diag_chats.clear()
     s.admin_active_diag.clear()
+    s.active_doctor_chats.clear()
+    s.doctor_active_chats.clear()
+    s.diag_chat_mode.clear()
+    s.diag_chat_req.clear()
 
-    candidates = []
+    # Legacy: admin <-> user SMS chats (status == 'assigned')
+    admin_candidates = []
     for req_id, req in s.diagnosis_requests.items():
         if req.get("type", "sms") != "sms":
             continue
@@ -41,12 +46,12 @@ def restore_active_diagnosis_chats():
         if assigned_admin not in s.admins:
             s.logger.warning("Skipping diagnosis chat restore for %s: admin %s is not active", req_id, assigned_admin)
             continue
-        candidates.append((parse_iso_datetime(req.get("created_at")), req_id, user_chat, assigned_admin))
+        admin_candidates.append((parse_iso_datetime(req.get("created_at")), req_id, user_chat, assigned_admin))
 
-    restored = 0
+    restored_admin = 0
     used_users = set()
     used_admins = set()
-    for _, req_id, user_chat, assigned_admin in sorted(candidates, reverse=True):
+    for _, req_id, user_chat, assigned_admin in sorted(admin_candidates, reverse=True):
         if user_chat in used_users or assigned_admin in used_admins:
             s.logger.warning("Skipping duplicate active diagnosis chat during restore: %s", req_id)
             continue
@@ -54,10 +59,43 @@ def restore_active_diagnosis_chats():
         s.admin_active_diag[assigned_admin] = user_chat
         used_users.add(user_chat)
         used_admins.add(assigned_admin)
-        restored += 1
+        restored_admin += 1
 
-    s.logger.info("Restored active diagnosis chats: %s", restored)
-    return restored
+    # New: doctor <-> user chats (status == 'chat_active')
+    doctor_candidates = []
+    for req_id, req in s.diagnosis_requests.items():
+        if req.get("status") != "chat_active":
+            continue
+        user_chat = req.get("user_chat")
+        doctor_tg = req.get("assigned_doctor_telegram_id")
+        if user_chat is None or doctor_tg is None:
+            continue
+        try:
+            user_chat = int(user_chat); doctor_tg = int(doctor_tg)
+        except (TypeError, ValueError):
+            continue
+        doctor_candidates.append((parse_iso_datetime(req.get("created_at")), req_id, user_chat, doctor_tg, req.get("type", "sms")))
+
+    restored_doctor = 0
+    used_users_d = set()
+    used_doctors = set()
+    for _, req_id, user_chat, doctor_tg, rtype in sorted(doctor_candidates, reverse=True):
+        if user_chat in used_users_d or doctor_tg in used_doctors:
+            s.logger.warning("Skipping duplicate active doctor chat during restore: %s", req_id)
+            continue
+        if user_chat in used_users:
+            s.logger.warning("User %s already has admin chat; skipping doctor restore for %s", user_chat, req_id)
+            continue
+        s.active_doctor_chats[user_chat] = doctor_tg
+        s.doctor_active_chats[doctor_tg] = user_chat
+        s.diag_chat_mode[user_chat] = "call" if rtype == "doctor_call" else "sms"
+        s.diag_chat_req[user_chat] = req_id
+        used_users_d.add(user_chat)
+        used_doctors.add(doctor_tg)
+        restored_doctor += 1
+
+    s.logger.info("Restored chats — admin: %s, doctor: %s", restored_admin, restored_doctor)
+    return restored_admin + restored_doctor
 
 
 def load_data():

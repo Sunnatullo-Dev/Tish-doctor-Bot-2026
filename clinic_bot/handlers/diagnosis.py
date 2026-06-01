@@ -31,7 +31,8 @@ def doctor_by_ids(clinic_id, doctor_id):
 
 def doctor_title(clinic, doctor):
     rating = round(get_doctor_rating(doctor), 1)
-    return f"{doctor.get('name', '-')} — {clinic.get('name', '-')} | {doctor.get('experience', '-')} | {rating}⭐"
+    specialty = doctor.get('specialty') or doctor.get('experience', '-')
+    return f"👨‍⚕️ Dr. {doctor.get('name', '-')} • {specialty} • {rating}⭐"
 
 
 def doctor_choice_keyboard(prefix, include_admin_choice=True):
@@ -39,8 +40,97 @@ def doctor_choice_keyboard(prefix, include_admin_choice=True):
     for clinic, doctor in all_doctors():
         kb.add(mk(doctor_title(clinic, doctor), f"{prefix}|{clinic['id']}|{doctor['id']}"))
     if include_admin_choice:
-        kb.add(mk("Admin doktor tanlasin", f"{prefix}|any"))
+        kb.add(mk("🛡️ Admin doktor tanlasin", f"{prefix}|any"))
     return kb
+
+
+def doctors_with_telegram():
+    rows = []
+    for clinic in clinics:
+        for doctor in clinic.get("doctors", []):
+            if doctor.get("telegram_id"):
+                rows.append((clinic, doctor))
+    return rows
+
+
+def doctor_assignable_keyboard(prefix):
+    """Keyboard listing only doctors with telegram_id (can receive chat through bot)."""
+    kb = InlineKeyboardMarkup()
+    for clinic, doctor in doctors_with_telegram():
+        kb.add(mk(doctor_title(clinic, doctor), f"{prefix}|{clinic['id']}|{doctor['id']}"))
+    return kb
+
+
+def start_doctor_chat(req, mode):
+    """Establish user <-> doctor chat (mode: 'sms' or 'call'). Returns True on success."""
+    user_chat = req.get("user_chat")
+    doctor_tg = req.get("assigned_doctor_telegram_id")
+    if user_chat is None or doctor_tg is None:
+        return False
+    # Drop any previous chats on either side
+    end_doctor_chat_for_user(user_chat, notify=False)
+    end_doctor_chat_for_doctor(doctor_tg, notify=False)
+    active_doctor_chats[user_chat] = doctor_tg
+    doctor_active_chats[doctor_tg] = user_chat
+    diag_chat_mode[user_chat] = mode
+    diag_chat_req[user_chat] = req["id"]
+    req["status"] = "chat_active"
+    req.setdefault("events", []).append({
+        "type": "chat_started", "mode": mode,
+        "by": doctor_tg, "ts": datetime.now(tz).isoformat()
+    })
+    return True
+
+
+def end_doctor_chat_for_user(user_chat, notify=True, closed_by=None):
+    """End chat from user side (or admin force-close)."""
+    doctor_tg = active_doctor_chats.pop(user_chat, None)
+    if doctor_tg is not None:
+        doctor_active_chats.pop(doctor_tg, None)
+    mode = diag_chat_mode.pop(user_chat, None)
+    req_id = diag_chat_req.pop(user_chat, None)
+    if req_id:
+        req = diagnosis_requests.get(req_id)
+        if req:
+            req["status"] = "closed"
+            req["closed_at"] = datetime.now(tz).isoformat()
+            if closed_by is not None:
+                req["closed_by"] = closed_by
+            req.setdefault("events", []).append({
+                "type": "chat_closed", "by": closed_by, "ts": datetime.now(tz).isoformat()
+            })
+    if notify and doctor_tg:
+        try:
+            bot.send_message(doctor_tg, "Bemor suhbatni tugatdi.")
+        except Exception:
+            pass
+    return doctor_tg, mode
+
+
+def end_doctor_chat_for_doctor(doctor_tg, notify=True, closed_by=None):
+    """End chat from doctor side."""
+    user_chat = doctor_active_chats.pop(doctor_tg, None)
+    if user_chat is not None:
+        active_doctor_chats.pop(user_chat, None)
+        mode = diag_chat_mode.pop(user_chat, None)
+        req_id = diag_chat_req.pop(user_chat, None)
+        if req_id:
+            req = diagnosis_requests.get(req_id)
+            if req:
+                req["status"] = "closed"
+                req["closed_at"] = datetime.now(tz).isoformat()
+                if closed_by is not None:
+                    req["closed_by"] = closed_by
+                req.setdefault("events", []).append({
+                    "type": "chat_closed", "by": closed_by, "ts": datetime.now(tz).isoformat()
+                })
+        if notify:
+            try:
+                bot.send_message(user_chat, "Doktor suhbatni tugatdi. Yangi suhbat boshlash uchun /start.")
+            except Exception:
+                pass
+        return user_chat
+    return None
 
 
 def remove_notify_buttons(req):
@@ -71,9 +161,8 @@ def call_request_text(req):
 
 def call_admin_keyboard(req_id, accepted=False):
     kb = InlineKeyboardMarkup()
-    if not accepted:
-        kb.row(mk("✅ Qabul qilish", f"diag_call_admin|accept|{req_id}"), mk("❌ Rad etish", f"diag_call_admin|reject|{req_id}"))
-    kb.row(mk("👨‍⚕️ Doktor tanlash", f"diag_call_admin|choose_doctor|{req_id}"))
+    kb.row(mk("👨‍⚕️ Doktorga yuborish", f"diag_call_admin|send_to_doctor|{req_id}"),
+           mk("❌ Rad etish", f"diag_call_admin|reject|{req_id}"))
     kb.row(mk("🔚 Yopish", f"diag_call_admin|close|{req_id}"))
     return kb
 
@@ -135,7 +224,7 @@ def send_call_management_panel(admin_id, req):
 @bot.message_handler(func=lambda m: button_matches(m.text, "🔎 Onlay tashhis"))
 def user_diag_menu(m: types.Message):
     kb = InlineKeyboardMarkup()
-    kb.row(mk("✉️ SMS yozish", "diag|sms"), mk("📞 Doktorga chaqiruv", "diag|call"))
+    kb.row(mk("💬 SMS yozish", "diag|sms"), mk("📞 Doktorga chaqiruv", "diag|call"))
     bot.send_message(m.chat.id, "Onlayn tashhisni tanlang:", reply_markup=kb)
 
 
@@ -162,7 +251,14 @@ def cb_diag_choice(call: types.CallbackQuery):
 
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id,{}).get('step') == "diag_wait_text")
 def mh_diag_text(m: types.Message):
-    chat = m.chat.id; txt = m.text.strip()
+    chat = m.chat.id
+    if not m.text:
+        bot.send_message(chat, "Iltimos matn yuboring.")
+        return
+    txt = m.text.strip()
+    if not txt:
+        bot.send_message(chat, "Bo'sh xabar. Qayta yuboring.")
+        return
     req_id = new_id("diag")
     diagnosis_requests[req_id] = {
         "id": req_id,
@@ -173,19 +269,27 @@ def mh_diag_text(m: types.Message):
         "created_at": datetime.now(tz).isoformat(),
         "status": "pending",
         "assigned_admin": None,
+        "assigned_doctor_id": None,
+        "assigned_doctor_name": None,
+        "assigned_doctor_telegram_id": None,
         "messages": [],
         "notify_msgs": []
     }
     kb = InlineKeyboardMarkup()
-    kb.row(mk("✅ Qabul qilaman", f"diag_admin|accept|{req_id}"), mk("❌ Rad etish", f"diag_admin|reject|{req_id}"))
+    kb.row(mk("👨‍⚕️ Doktorga yuborish", f"diag_admin|send_to_doctor|{req_id}"),
+           mk("❌ Rad etish", f"diag_admin|reject|{req_id}"))
     for aid in admins:
         try:
             first_name = escape(str(m.from_user.first_name or "-"))
-            msg = bot.send_message(aid, f"🔔 <b>Yangi tashhis so'rovi</b>\nID: {req_id}\nFoydalanuvchi: {chat} ({first_name})\nMatn:\n{escape(txt)}", parse_mode="HTML", reply_markup=kb)
+            msg = bot.send_message(aid,
+                f"🔔 <b>Yangi SMS so'rovi</b>\nID: <code>{req_id}</code>\nBemor: {chat} ({first_name})\nMatn:\n{escape(txt)}",
+                parse_mode="HTML", reply_markup=kb)
             diagnosis_requests[req_id]['notify_msgs'].append({"admin_id": aid, "chat_id": msg.chat.id, "message_id": msg.message_id})
         except Exception:
             logger.exception("notify admin failed")
-    user_state.pop(chat, None); bot.send_message(chat, "Xabaringiz adminlarga yuborildi. Tez orada kimdir qabul qiladi."); save_data()
+    user_state.pop(chat, None)
+    bot.send_message(chat, "✉️ Xabaringiz adminlarga yuborildi. Admin doktorni tanlaganidan keyin siz doktor bilan to'g'ridan-to'g'ri yozisha olasiz.")
+    save_data()
 
 
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id,{}).get('step') in ("diag_call_name", "diag_call_phone", "diag_call_address", "diag_call_details"))
@@ -230,8 +334,8 @@ def mh_diag_call_text(m: types.Message):
         data["details"] = text
         st["step"] = "diag_call_urgency"
         kb = InlineKeyboardMarkup()
-        kb.row(mk("Oddiy", "diag_call_urgency|normal"), mk("Bugun kerak", "diag_call_urgency|soon"))
-        kb.row(mk("Shoshilinch", "diag_call_urgency|urgent"))
+        kb.row(mk("🟢 Oddiy", "diag_call_urgency|normal"), mk("🟡 Bugun kerak", "diag_call_urgency|soon"))
+        kb.row(mk("🔴 Shoshilinch", "diag_call_urgency|urgent"))
         bot.send_message(chat, "Chaqiruv qanchalik shoshilinch?", reply_markup=kb)
 
 
@@ -297,31 +401,35 @@ def cb_diag_call_doctor(call: types.CallbackQuery):
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("diag_admin|"))
 def cb_diag_admin(call: types.CallbackQuery):
     bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id):
+        bot.send_message(call.message.chat.id, "Siz admin emassiz."); return
     parts = call.data.split("|")
     if len(parts) < 3: return
     action = parts[1]; req_id = parts[2]
     req = diagnosis_requests.get(req_id)
     if not req:
         bot.send_message(call.message.chat.id, "So'rov topilmadi yoki allaqachon qayta ishlangan."); return
-    if action == "accept":
-        if req.get('assigned_admin'):
-            bot.send_message(call.message.chat.id, "Ushbu so'rovni boshqa admin qabul qilgan."); return
-        req['assigned_admin'] = call.from_user.id
-        req['status'] = "assigned"
-        active_diag_chats[req['user_chat']] = call.from_user.id
-        admin_active_diag[call.from_user.id] = req['user_chat']
-        save_data()
-        remove_notify_buttons(req)
-        bot.send_message(call.from_user.id, f"✅ Siz {req_id} so'rovini qabul qildingiz. Endi bemor bilan shu admin orqali yozishishingiz mumkin.\nSuhbatni tugatish uchun /enddiag yoki quyidagi tugma.")
-        try:
-            kb = InlineKeyboardMarkup()
-            kb.row(mk("🔚 Suhbatni yopish", f"diag_end|{req_id}"))
-            bot.send_message(req['user_chat'], f"✅ Admin {call.from_user.first_name or call.from_user.id} sizning so'rovingizni qabul qildi. Endi shu admin bilan yozishishingiz mumkin.", reply_markup=kb)
-        except Exception:
-            pass
+    if action in ("accept", "send_to_doctor"):
+        # New flow: admin picks doctor to forward SMS to
+        if req.get("status") in ("closed", "rejected", "chat_active"):
+            bot.send_message(call.from_user.id, "Bu so'rov allaqachon ishlangan.")
+            return
+        if not doctors_with_telegram():
+            bot.send_message(call.from_user.id,
+                "Telegram ID ulangan doktor yo'q. Avval doktor qo'shing yoki mavjud doktorga Telegram ID kiriting.")
+            return
+        kb = doctor_assignable_keyboard(f"diag_assign|sms|{req_id}")
+        bot.send_message(call.from_user.id,
+            f"So'rov <code>{req_id}</code> uchun doktorni tanlang:",
+            parse_mode="HTML", reply_markup=kb)
         return
     if action == "reject":
+        if req.get('assigned_admin') and req.get('assigned_admin') != call.from_user.id:
+            bot.send_message(call.from_user.id, "Ushbu so'rovni boshqa admin allaqachon ko'rgan.")
+            return
         req['status'] = "rejected"
+        req['rejected_by'] = call.from_user.id
+        req['rejected_at'] = datetime.now(tz).isoformat()
         remove_notify_buttons(req)
         save_data()
         bot.send_message(call.from_user.id, "So'rov rad etildi.")
@@ -329,6 +437,200 @@ def cb_diag_admin(call: types.CallbackQuery):
             bot.send_message(req['user_chat'], "Afsuski, so'rovingiz hozircha qabul qilinmadi. Keyinroq urinib ko'ring.")
         except Exception:
             pass
+        return
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("diag_assign|"))
+def cb_diag_assign(call: types.CallbackQuery):
+    """Admin assigns a request (SMS or call) to a specific doctor."""
+    bot.answer_callback_query(call.id)
+    if not is_admin(call.from_user.id):
+        bot.send_message(call.from_user.id, "Siz admin emassiz."); return
+    parts = call.data.split("|")
+    if len(parts) < 5:
+        bot.send_message(call.from_user.id, "Tugma noto'g'ri."); return
+    _, rtype, req_id, clinic_id, doctor_id = parts[:5]
+    req = diagnosis_requests.get(req_id)
+    if not req:
+        bot.send_message(call.from_user.id, "So'rov topilmadi."); return
+    if req.get("status") in ("closed", "rejected", "chat_active"):
+        bot.send_message(call.from_user.id, "Bu so'rov allaqachon ishlangan.")
+        return
+    clinic, doctor = doctor_by_ids(clinic_id, doctor_id)
+    if not doctor:
+        bot.send_message(call.from_user.id, "Doktor topilmadi."); return
+    if not doctor.get("telegram_id"):
+        bot.send_message(call.from_user.id, "Doktor Telegram ID ga ega emas. Boshqasini tanlang.")
+        return
+    # Update request
+    req["assigned_admin"] = req.get("assigned_admin") or call.from_user.id
+    req["assigned_clinic_id"] = clinic["id"]
+    req["assigned_doctor_id"] = doctor["id"]
+    req["assigned_doctor_name"] = doctor_title(clinic, doctor)
+    req["assigned_doctor_telegram_id"] = doctor["telegram_id"]
+    req["status"] = "doctor_pending"
+    req.setdefault("events", []).append({
+        "type": "doctor_assigned", "doctor_id": doctor["id"],
+        "by": call.from_user.id, "ts": datetime.now(tz).isoformat()
+    })
+    save_data()
+    # Notify doctor
+    kb = InlineKeyboardMarkup()
+    if rtype == "sms":
+        kb.row(mk("✅ SMS suhbatni qabul qilaman", f"diag_doctor|accept|{req_id}"))
+    else:
+        kb.row(mk("✅ Audio/video suhbatni qabul qilaman", f"diag_doctor|accept|{req_id}"))
+    kb.row(mk("❌ Rad etish", f"diag_doctor|reject|{req_id}"))
+    if rtype == "sms":
+        intro = (f"📩 <b>Sizga SMS suhbat yuborildi</b>\n"
+                 f"ID: <code>{req_id}</code>\n"
+                 f"Bemor: {escape(str(req.get('user_first_name') or '-'))}\n\n"
+                 f"<b>Bemorning muammosi:</b>\n{escape(str(req.get('text') or '-'))}")
+    else:
+        intro = "📞 <b>Sizga audio/video chaqiruv yuborildi</b>\n\n" + call_request_text(req)
+    try:
+        bot.send_message(doctor["telegram_id"], intro, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        logger.exception("notify doctor failed")
+        bot.send_message(call.from_user.id, "Doktorga Telegram orqali xabar yuborilmadi.")
+        return
+    bot.send_message(call.from_user.id, f"✅ Doktor tanlandi: {req['assigned_doctor_name']}. Doktor javobi kutilmoqda.")
+    try:
+        bot.send_message(req["user_chat"],
+            f"👨‍⚕️ Sizning so'rovingiz uchun doktor tanlandi:\n<b>{escape(req['assigned_doctor_name'])}</b>\nDoktor javobini kuting.",
+            parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("diag_doctor|"))
+def cb_diag_doctor(call: types.CallbackQuery):
+    """Doctor accepts or rejects a request (SMS or call). On accept, start user<->doctor chat."""
+    bot.answer_callback_query(call.id)
+    parts = call.data.split("|")
+    if len(parts) < 3:
+        return
+    action, req_id = parts[1], parts[2]
+    req = diagnosis_requests.get(req_id)
+    if not req:
+        bot.send_message(call.from_user.id, "So'rov topilmadi."); return
+    if req.get("assigned_doctor_telegram_id") != call.from_user.id:
+        bot.send_message(call.from_user.id, "Bu so'rov sizga biriktirilmagan.")
+        return
+    if req.get("status") in ("closed", "rejected", "chat_active") and action == "accept":
+        bot.send_message(call.from_user.id, "Bu so'rov hozir qabul qilinishi mumkin emas (allaqachon ishlangan).")
+        return
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    if action == "accept":
+        # Determine mode
+        mode = "call" if req.get("type") == "doctor_call" else "sms"
+        if not start_doctor_chat(req, mode):
+            bot.send_message(call.from_user.id, "Suhbat ochishda xatolik.")
+            return
+        save_data()
+
+        # Look up the doctor object for richer card
+        clinic_id = req.get("assigned_clinic_id")
+        doctor_id = req.get("assigned_doctor_id")
+        doc_clinic, doc_obj = doctor_by_ids(clinic_id, doctor_id) if (clinic_id and doctor_id) else (None, None)
+        doc_short_name = (doc_obj.get("name") if doc_obj else None) or req.get("assigned_doctor_name", "Doktor").split(" — ")[0]
+        doc_specialty = (doc_obj.get("specialty") if doc_obj else None) or "-"
+        doc_experience = (doc_obj.get("experience") if doc_obj else None) or "-"
+        doc_photo = doc_obj.get("photo_file_id") if doc_obj else None
+        user_first = req.get("user_first_name") or "Bemor"
+        patient_phone = req.get("patient_phone")
+
+        # ---- Message to the patient (user) ----
+        if mode == "sms":
+            user_card = (
+                f"✅ <b>Suhbat boshlandi</b>\n\n"
+                f"👨‍⚕️ Siz hozir <b>Dr. {escape(str(doc_short_name))}</b> bilan yozishyapsiz.\n"
+                f"🎓 Mutaxassis: {escape(str(doc_specialty))}\n"
+                f"📅 Tajriba: {escape(str(doc_experience))}\n\n"
+                f"💬 Endi xabaringizni shu yerga yozing — doktorga to'g'ridan-to'g'ri yetkaziladi.\n"
+                f"🔚 Tugatish: /tugatish"
+            )
+        else:
+            user_card = (
+                f"✅ <b>Audio/video suhbat boshlandi</b>\n\n"
+                f"👨‍⚕️ Siz hozir <b>Dr. {escape(str(doc_short_name))}</b> bilan bog'landingiz.\n"
+                f"🎓 Mutaxassis: {escape(str(doc_specialty))}\n"
+                f"📅 Tajriba: {escape(str(doc_experience))}\n\n"
+                f"🎙 Faqat <b>ovozli xabar</b> yoki <b>video xabar</b> yuboring.\n"
+                f"🔚 Tugatish: /tugatish"
+            )
+        try:
+            if doc_photo:
+                bot.send_photo(req["user_chat"], doc_photo, caption=user_card, parse_mode="HTML")
+            else:
+                bot.send_message(req["user_chat"], user_card, parse_mode="HTML")
+        except Exception:
+            try:
+                bot.send_message(req["user_chat"], user_card, parse_mode="HTML")
+            except Exception:
+                logger.exception("notify user about chat start failed")
+
+        # ---- Message to the doctor ----
+        original_text = req.get("text") or req.get("details") or "-"
+        if mode == "sms":
+            doctor_card = (
+                f"✅ <b>SMS suhbat boshlandi</b>\n\n"
+                f"👤 Bemor: <b>{escape(str(user_first))}</b>\n"
+                + (f"☎️ Telefon: <code>{escape(str(patient_phone))}</code>\n" if patient_phone else "")
+                + f"\n📝 Dastlabki xabar:\n<i>{escape(str(original_text))}</i>\n\n"
+                f"💬 Javobingizni shu yerga yozing.\n"
+                f"🔚 Tugatish: /tugatish"
+            )
+        else:
+            address = req.get("address") or "-"
+            urgency = CALL_URGENCY_LABELS.get(req.get("urgency"), req.get("urgency") or "-")
+            doctor_card = (
+                f"✅ <b>Audio/video suhbat boshlandi</b>\n\n"
+                f"👤 Bemor: <b>{escape(str(user_first))}</b>\n"
+                + (f"☎️ Telefon: <code>{escape(str(patient_phone))}</code>\n" if patient_phone else "")
+                + f"🏠 Manzil: {escape(str(address))}\n"
+                f"⚡ Shoshilinchlik: {escape(str(urgency))}\n\n"
+                f"📝 Muammo:\n<i>{escape(str(original_text))}</i>\n\n"
+                f"🎙 Faqat <b>ovozli</b> yoki <b>video xabar</b> yuboring.\n"
+                f"🔚 Tugatish: /tugatish"
+            )
+        bot.send_message(call.from_user.id, doctor_card, parse_mode="HTML")
+
+        # Notify admin
+        admin_id = req.get("assigned_admin")
+        if admin_id and admin_id != call.from_user.id:
+            try:
+                mode_label = "Audio/video" if mode == "call" else "SMS"
+                bot.send_message(admin_id, f"ℹ️ Doktor so'rov <code>{req_id}</code> ni qabul qildi. {mode_label} suhbat boshlandi.", parse_mode="HTML")
+            except Exception:
+                pass
+        return
+    if action == "reject":
+        req["status"] = "doctor_rejected"
+        req.setdefault("events", []).append({"type":"doctor_rejected","by":call.from_user.id,"ts":datetime.now(tz).isoformat()})
+        save_data()
+        bot.send_message(call.from_user.id, "Siz so'rovni rad etdingiz.")
+        # Let user know
+        try:
+            bot.send_message(req["user_chat"], "Doktor hozircha bog'lana olmasligini bildirdi. Admin boshqa doktor bilan urinadi.")
+        except Exception:
+            pass
+        # Notify admins so they can reassign
+        rtype = "sms" if req.get("type") == "sms" else "call"
+        kb = InlineKeyboardMarkup()
+        kb.row(mk("👨‍⚕️ Boshqa doktorga yuborish",
+                  f"diag_admin|send_to_doctor|{req_id}" if rtype == "sms"
+                  else f"diag_call_admin|send_to_doctor|{req_id}"))
+        for aid in admins:
+            try:
+                bot.send_message(aid,
+                    f"⚠️ Doktor so'rov <code>{req_id}</code> ni rad etdi.\nBoshqa doktorga yuboring.",
+                    parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
         return
 
 
@@ -350,20 +652,21 @@ def cb_diag_call_admin(call: types.CallbackQuery):
         bot.send_message(call.from_user.id, "Bu chaqiruv allaqachon yakunlangan.")
         return
 
-    if action == "accept":
-        if req.get("assigned_admin") and req.get("assigned_admin") != call.from_user.id:
-            bot.send_message(call.from_user.id, "Bu chaqiruvni boshqa admin qabul qilgan.")
+    if action in ("accept", "send_to_doctor", "choose_doctor"):
+        # All admin first-touch actions now lead to doctor picker
+        if req.get("status") in ("closed", "rejected", "chat_active"):
+            bot.send_message(call.from_user.id, "Bu chaqiruv allaqachon ishlangan.")
             return
-        req["assigned_admin"] = call.from_user.id
-        req["status"] = "admin_accepted"
-        req.setdefault("events", []).append({"type": "admin_accepted", "by": call.from_user.id, "ts": datetime.now(tz).isoformat()})
-        remove_notify_buttons(req)
+        if not doctors_with_telegram():
+            bot.send_message(call.from_user.id,
+                "Telegram ID ulangan doktor yo'q. Avval doktor qo'shing yoki doktorga Telegram ID kiriting.")
+            return
+        req["assigned_admin"] = req.get("assigned_admin") or call.from_user.id
         save_data()
-        send_call_management_panel(call.from_user.id, req)
-        try:
-            bot.send_message(req["user_chat"], f"✅ Doktorga chaqiruv so'rovingiz admin tomonidan qabul qilindi. ID: {req_id}")
-        except Exception:
-            pass
+        kb = doctor_assignable_keyboard(f"diag_assign|call|{req_id}")
+        bot.send_message(call.from_user.id,
+            f"Chaqiruv <code>{req_id}</code> uchun doktorni tanlang:",
+            parse_mode="HTML", reply_markup=kb)
         return
 
     if action == "reject":
@@ -378,13 +681,6 @@ def cb_diag_call_admin(call: types.CallbackQuery):
             bot.send_message(req["user_chat"], "Afsuski, doktorga chaqiruv so'rovingiz rad etildi. Qo'shimcha ma'lumot uchun klinika bilan bog'laning.")
         except Exception:
             pass
-        return
-
-    if action == "choose_doctor":
-        if not all_doctors():
-            bot.send_message(call.from_user.id, "Doktorlar ro'yxati bo'sh. Avval doktor qo'shing.")
-            return
-        bot.send_message(call.from_user.id, "Chaqiruv uchun doktorni tanlang:", reply_markup=doctor_choice_keyboard(f"diag_call_assign|{req_id}", include_admin_choice=False))
         return
 
     if action == "close":
@@ -448,8 +744,8 @@ def cb_diag_call_assign(call: types.CallbackQuery):
 
     if doctor.get("telegram_id"):
         kb = InlineKeyboardMarkup()
-        kb.row(mk("✅ Chaqiruvni qabul qilaman", f"doctor_call|accept|{req_id}"))
-        kb.row(mk("❌ Bora olmayman", f"doctor_call|reject|{req_id}"))
+        kb.row(mk("✅ Audio/video suhbatni qabul qilaman", f"diag_doctor|accept|{req_id}"))
+        kb.row(mk("❌ Rad etish", f"diag_doctor|reject|{req_id}"))
         try:
             bot.send_message(doctor["telegram_id"], call_request_text(req), parse_mode="HTML", reply_markup=kb)
         except Exception:
@@ -459,52 +755,18 @@ def cb_diag_call_assign(call: types.CallbackQuery):
         bot.send_message(call.from_user.id, f"Doktor Telegram ID ulanmagan. Telefon: {doctor.get('phone', '-')}")
 
 
+# Legacy compatibility: old doctor_call|accept/reject buttons (still floating in admin/doctor chats)
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("doctor_call|"))
 def cb_doctor_call(call: types.CallbackQuery):
+    """Legacy handler. Redirects to the new diag_doctor flow."""
     bot.answer_callback_query(call.id)
     parts = call.data.split("|")
     if len(parts) < 3:
         return
     action, req_id = parts[1], parts[2]
-    req = diagnosis_requests.get(req_id)
-    if not req or req.get("type") != "doctor_call":
-        bot.send_message(call.from_user.id, "Chaqiruv topilmadi.")
-        return
-    if req.get("status") in ("closed", "rejected"):
-        bot.send_message(call.from_user.id, "Bu chaqiruv allaqachon yopilgan.")
-        return
-    if req.get("assigned_doctor_telegram_id") != call.from_user.id:
-        bot.send_message(call.from_user.id, "Bu chaqiruv sizga biriktirilmagan.")
-        return
-    if action == "accept":
-        req["status"] = "doctor_confirmed"
-        event_type = "doctor_confirmed"
-        user_msg = f"✅ Doktor chaqiruvingizni tasdiqladi: {req.get('assigned_doctor_name')}"
-        doctor_msg = "Chaqiruv qabul qilindi. Admin va bemorga xabar berildi."
-    elif action == "reject":
-        req["status"] = "doctor_rejected"
-        event_type = "doctor_rejected"
-        user_msg = "Doktor hozircha bora olmasligini bildirdi. Admin boshqa doktor bilan bog'lanadi."
-        doctor_msg = "Javob qabul qilindi. Admin boshqa doktor tanlashi mumkin."
-    else:
-        return
-    req.setdefault("events", []).append({"type": event_type, "by": call.from_user.id, "ts": datetime.now(tz).isoformat()})
-    save_data()
-    try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-    except Exception:
-        pass
-    bot.send_message(call.from_user.id, doctor_msg)
-    try:
-        bot.send_message(req["user_chat"], user_msg)
-    except Exception:
-        pass
-    admin_id = req.get("assigned_admin")
-    if admin_id:
-        try:
-            bot.send_message(admin_id, f"Doktor javobi: {CALL_URGENCY_LABELS.get(req.get('urgency'), '-')}\n{call_request_text(req)}", parse_mode="HTML", reply_markup=call_admin_keyboard(req_id, accepted=True))
-        except Exception:
-            pass
+    # Translate to new callback and reuse handler
+    call.data = f"diag_doctor|{action}|{req_id}"
+    cb_diag_doctor(call)
 
 
 @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("diag_end|"))
@@ -527,13 +789,53 @@ def cb_diag_end(call: types.CallbackQuery):
 
 @bot.message_handler(commands=['enddiag'])
 def cmd_enddiag(m: types.Message):
-    admin = m.from_user.id
-    if admin not in admin_active_diag:
-        bot.send_message(m.chat.id, "Sizda faol tashhis yo'q."); return
-    user = admin_active_diag.pop(admin); active_diag_chats.pop(user, None)
-    for req in diagnosis_requests.values():
-        if req.get('user_chat') == user and req.get('assigned_admin') == admin and req.get('status') == 'assigned':
-            req['status'] = 'closed'; break
-    save_data(); bot.send_message(m.chat.id, "Suhbat muvaffaqiyatli yopildi.")
-    try: bot.send_message(user, "Admin suhbatni tugatdi. /start bilan qayta boshlashingiz mumkin.")
-    except Exception: pass
+    uid = m.from_user.id
+    # admin side
+    if uid in admin_active_diag:
+        user = admin_active_diag.pop(uid); active_diag_chats.pop(user, None)
+        for req in diagnosis_requests.values():
+            if req.get('user_chat') == user and req.get('assigned_admin') == uid and req.get('status') == 'assigned':
+                req['status'] = 'closed'; break
+        save_data(); bot.send_message(m.chat.id, "Suhbat muvaffaqiyatli yopildi.")
+        try: bot.send_message(user, "Admin suhbatni tugatdi. /start bilan qayta boshlashingiz mumkin.")
+        except Exception: pass
+        return
+    # user side
+    chat = m.chat.id
+    if chat in active_diag_chats:
+        admin = active_diag_chats.pop(chat)
+        admin_active_diag.pop(admin, None)
+        for req in diagnosis_requests.values():
+            if req.get('user_chat') == chat and req.get('assigned_admin') == admin and req.get('status') == 'assigned':
+                req['status'] = 'closed'; break
+        save_data()
+        bot.send_message(chat, "Suhbat yopildi. /start orqali qayta boshlashingiz mumkin.")
+        try: bot.send_message(admin, f"Bemor {chat} suhbatni tugatdi.")
+        except Exception: pass
+        return
+    bot.send_message(m.chat.id, "Sizda faol tashhis suhbati yo'q.")
+
+
+@bot.message_handler(commands=['tugatish'])
+def cmd_tugatish(m: types.Message):
+    """End an active doctor<->user chat from either side."""
+    uid = m.from_user.id
+    chat = m.chat.id
+    # Doctor side
+    if uid in doctor_active_chats:
+        user_chat = end_doctor_chat_for_doctor(uid, notify=True, closed_by=uid)
+        save_data()
+        bot.send_message(chat, "✅ Suhbat yopildi.")
+        return
+    # User side
+    if chat in active_doctor_chats:
+        doctor_tg, _ = end_doctor_chat_for_user(chat, notify=True, closed_by=chat)
+        save_data()
+        bot.send_message(chat, "✅ Suhbat yopildi. /start orqali qayta boshlashingiz mumkin.")
+        return
+    # Fallback: legacy admin chats
+    if uid in admin_active_diag or chat in active_diag_chats:
+        # Delegate to legacy enddiag
+        cmd_enddiag(m)
+        return
+    bot.send_message(chat, "Sizda faol suhbat yo'q.")
